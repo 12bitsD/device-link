@@ -14,6 +14,7 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 - `dl invite --name <name> [--ttl 24h]` (controller) generates a one-time short-lived invite code and prints a single paste-ready command:
   `dl join --hub <url> --code <code> [--service]`
 - `dl join` exchanges the one-time invite code for a persistent `device_token` stored in the node's `--state-dir`, then opens one persistent WebSocket control connection to the Hub.
+- Immediately upon establishing (or re-establishing) the WebSocket session, `dl join` prints a single status line to stdout reporting the assigned `name`, `status=alive`, `os/arch`, `shell`, and `expires_at` (`never` or RFC3339 timestamp), and resets its reconnect backoff to the initial interval (`250ms`). The WebSocket loop decouples reading incoming Hub frames from periodic heartbeat pings so Hub-pushed commands are received without delay.
 - Each device record has `expires_at` (`null` by default = never expires). Controller can change it via `dl ttl <name> <duration|never>` or revoke & kick via `dl rm <name>`.
 - Hub maintains a single namespace mapping `name -> live connection`:
   - Name collision from a *different* device auto-appends an incrementing suffix: `mac` -> `mac-2` -> `mac-3`.
@@ -62,4 +63,5 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 
 - Tests exercise the real compiled `./dl` binary in isolated multi-process setups (`--state-dir` per process, ephemeral localhost ports).
 - Local TCP fault/throttle proxy simulates network drops (3s drop -> `missed`, offline job continuation & resume) and throttled transfers concurrent with `exec`.
-- Each test asserts no goroutine or temp-file leaks on teardown; GitHub Actions runs `ubuntu-latest`, `macos-latest`, `windows-latest`.
+- Every E2E test asserts zero lingering child processes, zero leaked temp files, and zero unexpected Hub disk files on teardown, and passes `go test -race -count=3 ./test/e2e` without flakes.
+- Cross-platform verification covers `CGO_ENABLED=0` builds across `darwin/linux/windows` (`amd64/arm64`), cross-compiled E2E test binaries for `linux` and `windows`, local Linux container (`colima`/`docker`) node-to-host-Hub interop, and GitHub Actions on `ubuntu-latest`, `macos-latest`, and `windows-latest`.

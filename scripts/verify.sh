@@ -52,10 +52,13 @@ else
   echo "warning: bits CLI not installed; skipping bits audit"
 fi
 
-echo "==> go test -race (unit + blackbox E2E)"
-CGO_ENABLED=1 go test -race -count=1 ./...
+echo "==> go test -race (internal unit tests)"
+CGO_ENABLED=1 go test -race -count=1 ./cmd/... ./internal/...
 
-echo "==> cross-compile (CGO_ENABLED=0)"
+echo "==> go test -race -count=3 (blackbox E2E stability gate)"
+CGO_ENABLED=1 go test -race -count=3 ./test/e2e
+
+echo "==> cross-compile binaries & OS-specific E2E test suites (CGO_ENABLED=0)"
 tmp_bin="$tmp_dir/bin"
 mkdir -p "$tmp_bin"
 for os in darwin linux windows; do
@@ -68,5 +71,7 @@ for os in darwin linux windows; do
     CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -o "$tmp_bin/dl-$os-$arch$ext" ./cmd/dl
   done
 done
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o "$tmp_bin/e2e-linux.test" ./test/e2e
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "$tmp_bin/e2e-windows.test.exe" ./test/e2e
 
 echo "==> verify OK"
