@@ -29,6 +29,18 @@ func TestParamCountIsWarning(t *testing.T) {
 	}
 }
 
+func TestE2ESleepRule(t *testing.T) {
+	src := []byte("package e2e\nimport \"time\"\nfunc f() { time.Sleep(time.Second) }\n")
+	diags := analyzeFile(token.NewFileSet(), "test/e2e/foo_test.go", src)
+	if len(diags) != 1 || diags[0].rule != "E2E_SLEEP" || diags[0].severity != severityViolation {
+		t.Fatalf("expected E2E_SLEEP violation, got %+v", diags)
+	}
+	prod := analyzeFile(token.NewFileSet(), "internal/node/node.go", src)
+	if len(prod) != 0 {
+		t.Fatalf("unexpected diagnostics outside test/e2e: %+v", prod)
+	}
+}
+
 func checkFixtureDir(t *testing.T, dir string, check func(*testing.T, string)) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)

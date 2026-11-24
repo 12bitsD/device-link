@@ -1,7 +1,7 @@
 package util // want "PKGNAME"
 
 import (
-	. "fmt" // want "IMPORT"
+	. "fmt"            // want "IMPORT"
 	_ "net/http/pprof" // want "IMPORT"
 )
 

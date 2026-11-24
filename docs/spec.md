@@ -5,12 +5,12 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 ## 1. Roles & Trust Model
 
 - **Hub**: Self-hosted lightweight public HTTPS server (`dl hub`) that solves double-NAT (home Wi-Fi <-> mobile hotspot / private K8s Pod without public IP). All nodes dial outbound to the Hub.
-- **Node (controlled device)**: Runs `dl join`. Holds only its own long-term `device_token`. Can maintain its connection and execute jobs locally; **cannot** enumerate or control other devices (controller APIs return 401/403 fail-closed).
-- **Controller**: Any machine holding the Hub's controller token (`--token` flag or `DL_TOKEN` env / `--state-dir` config). Runs `invite`, `ls`, `ttl`, `rm`, `exec`, `job`, `cp`, `transfer`.
+- **Node (controlled device)**: Runs `dl join`. Holds only its own long-term `device_token`. Can maintain its connection and execute jobs locally; **cannot** enumerate or control other devices (controller APIs return 401/403 fail-closed). Revoked or expired device credentials (401/403) terminate `dl join` with a non-zero exit instead of retrying forever.
+- **Controller**: Any machine holding the Hub's controller token (`--token` flag > `DL_TOKEN` env > `<state-dir>/controller_token`, where `--state-dir` defaults to `~/.device-link/hub`; `--ca` defaults to `<state-dir>/cert.pem` when omitted). Runs `invite`, `ls`, `ttl`, `rm`, `exec`, `job`, `cp`, `transfer`.
 
 ## 2. Onboarding, TTL & Namespace
 
-- `dl hub --addr :8443 --state-dir <dir>` initializes the Hub state (pure-Go SQLite, single file) and prints/stores the initial controller token.
+- `dl hub --addr :8443 [--host <advertised-host-or-ip>] --state-dir <dir>` initializes the Hub state (pure-Go SQLite, single file) and prints/stores the initial controller token and bound `DL_ADDR`. The self-signed certificate always covers `localhost`/`127.0.0.1`/`::1`; `--host` adds a LAN/public DNS name or IP to its SANs.
 - `dl invite --name <name> [--ttl 24h]` (controller) generates a one-time short-lived invite code and prints a single paste-ready command:
   `dl join --hub <url> --code <code> [--service]`
 - `dl join` exchanges the one-time invite code for a persistent `device_token` stored in the node's `--state-dir`, then opens one persistent WebSocket control connection to the Hub.

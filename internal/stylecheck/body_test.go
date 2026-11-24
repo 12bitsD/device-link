@@ -240,6 +240,7 @@ func (b *bodyChecker) checkFuncLit(lit *ast.FuncLit) {
 }
 
 func (b *bodyChecker) checkCall(call *ast.CallExpr) {
+	b.checkE2ESleep(call)
 	if id, isIdent := call.Fun.(*ast.Ident); isIdent && id.Name == "panic" && !b.v.allowed(call.Pos(), "GO001") {
 		b.v.errorf(call.Pos(), "GO001", "panic is forbidden outside tests")
 		return
@@ -255,5 +256,19 @@ func (b *bodyChecker) checkCall(call *ast.CallExpr) {
 	name := pkg.Name + "." + sel.Sel.Name
 	if name == "os.Exit" || strings.HasPrefix(name, "log.Fatal") {
 		b.v.errorf(call.Pos(), "GO001", "%s is forbidden outside cmd/dl and tests", name)
+	}
+}
+
+func (b *bodyChecker) checkE2ESleep(call *ast.CallExpr) {
+	if !strings.Contains("/"+b.v.path, "/test/e2e/") || b.v.allowed(call.Pos(), "E2E_SLEEP") {
+		return
+	}
+	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	if !isSel {
+		return
+	}
+	pkg, isPkg := sel.X.(*ast.Ident)
+	if isPkg && pkg.Name == "time" && sel.Sel.Name == "Sleep" {
+		b.v.errorf(call.Pos(), "E2E_SLEEP", "use condition-based waitFor instead of fixed time.Sleep")
 	}
 }
