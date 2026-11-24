@@ -7,12 +7,15 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 )
+
+const defaultControlTimeout = 15 * time.Second
 
 type Client struct {
 	baseURL string
@@ -42,7 +45,6 @@ func New(baseURL, token, caPath string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	httpClient.Timeout = 15 * time.Second
 	return &Client{baseURL: normalized, token: token, http: httpClient}, nil
 }
 
@@ -52,7 +54,10 @@ func NormalizeHubURL(raw string) (string, error) {
 		return "", fmt.Errorf("hub URL is required")
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if err != nil {
+		return "", fmt.Errorf("invalid hub HTTPS URL %q: %w", raw, err)
+	}
+	if parsed.Scheme != "https" || parsed.Host == "" {
 		return "", fmt.Errorf("invalid hub HTTPS URL %q", raw)
 	}
 	return trimmed, nil
@@ -85,17 +90,19 @@ func ttlSeconds(ttl *time.Duration) *int64 {
 }
 
 func (c *Client) Invite(ctx context.Context, name string, ttl *time.Duration) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, defaultControlTimeout)
+	defer cancel()
 	request := struct {
 		Name       string `json:"name"`
 		TTLSeconds *int64 `json:"ttl_seconds"`
 	}{Name: name, TTLSeconds: ttlSeconds(ttl)}
-	response, err := c.request(ctx, http.MethodPost, "/v1/invites", request)
+	response, err := c.request(reqCtx, http.MethodPost, "/v1/invites", request)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("invite rejected: %s", response.Status)
+		return "", responseError("invite", response)
 	}
 	var invite struct {
 		Code string `json:"code"`
@@ -107,13 +114,15 @@ func (c *Client) Invite(ctx context.Context, name string, ttl *time.Duration) (s
 }
 
 func (c *Client) List(ctx context.Context) ([]Device, error) {
-	response, err := c.request(ctx, http.MethodGet, "/v1/devices", nil)
+	reqCtx, cancel := context.WithTimeout(ctx, defaultControlTimeout)
+	defer cancel()
+	response, err := c.request(reqCtx, http.MethodGet, "/v1/devices", nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list rejected: %s", response.Status)
+		return nil, responseError("list", response)
 	}
 	devices := make([]Device, 0)
 	if err := json.NewDecoder(response.Body).Decode(&devices); err != nil {
@@ -123,26 +132,30 @@ func (c *Client) List(ctx context.Context) ([]Device, error) {
 }
 
 func (c *Client) SetTTL(ctx context.Context, name string, ttl *time.Duration) error {
+	reqCtx, cancel := context.WithTimeout(ctx, defaultControlTimeout)
+	defer cancel()
 	path := "/v1/devices/" + url.PathEscape(name) + "/ttl"
-	response, err := c.request(ctx, http.MethodPut, path, map[string]*int64{"ttl_seconds": ttlSeconds(ttl)})
+	response, err := c.request(reqCtx, http.MethodPut, path, map[string]*int64{"ttl_seconds": ttlSeconds(ttl)})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("TTL update rejected: %s", response.Status)
+		return responseError("TTL update", response)
 	}
 	return nil
 }
 
 func (c *Client) Delete(ctx context.Context, name string) error {
-	response, err := c.request(ctx, http.MethodDelete, "/v1/devices/"+url.PathEscape(name), nil)
+	reqCtx, cancel := context.WithTimeout(ctx, defaultControlTimeout)
+	defer cancel()
+	response, err := c.request(reqCtx, http.MethodDelete, "/v1/devices/"+url.PathEscape(name), nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("delete rejected: %s", response.Status)
+		return responseError("delete", response)
 	}
 	return nil
 }
@@ -159,10 +172,23 @@ func (c *Client) request(ctx context.Context, method, path string, value any) (*
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.token)
-	request.Header.Set("Content-Type", "application/json")
+	if value != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	response, err := c.http.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("call hub: %w", err)
 	}
 	return response, nil
+}
+
+func responseError(action string, response *http.Response) error {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if json.Unmarshal(raw, &payload) == nil && payload.Error != "" {
+		return fmt.Errorf("%s failed: %s (%s)", action, payload.Error, response.Status)
+	}
+	return fmt.Errorf("%s failed: %s", action, response.Status)
 }

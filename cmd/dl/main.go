@@ -24,30 +24,41 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "dl:", err)
-		os.Exit(1)
+		code := 1
+		var codeErr exitCodeError
+		if errors.As(err, &codeErr) {
+			code = codeErr.code
+		}
+		if err.Error() != "" {
+			fmt.Fprintln(os.Stderr, "dl:", err)
+		}
+		os.Exit(code)
 	}
 }
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: dl <hub|invite|join|ls|ttl|rm> [flags]")
+		return fmt.Errorf("usage: dl <hub|invite|join|ls|ttl|rm|exec|job|cp|transfer> [flags]")
 	}
-	switch args[0] {
-	case "hub":
-		return runHub(ctx, args[1:])
-	case "invite":
-		return runInvite(ctx, args[1:])
-	case "join":
-		return runJoin(ctx, args[1:])
-	case "ls":
-		return runList(ctx, args[1:])
-	case "ttl":
-		return runTTL(ctx, args[1:])
-	case "rm":
-		return runRemove(ctx, args[1:])
-	default:
+	handler, ok := subcommands()[args[0]]
+	if !ok {
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+	return handler(ctx, args[1:])
+}
+
+func subcommands() map[string]func(context.Context, []string) error {
+	return map[string]func(context.Context, []string) error{
+		"hub":      runHub,
+		"invite":   runInvite,
+		"join":     runJoin,
+		"ls":       runList,
+		"ttl":      runTTL,
+		"rm":       runRemove,
+		"exec":     runExec,
+		"job":      runJob,
+		"cp":       runCP,
+		"transfer": runTransfer,
 	}
 }
 

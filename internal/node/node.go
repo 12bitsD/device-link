@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/12bitsD/device-link/internal/client"
+	"github.com/12bitsD/device-link/internal/transfer"
 	"github.com/coder/websocket"
 )
 
@@ -21,6 +23,7 @@ const (
 	initialBackoff = 250 * time.Millisecond
 	maxBackoff     = 2 * time.Second
 	frameTimeout   = 3 * time.Second
+	maxFrameBytes  = 16 << 20
 )
 
 var errUnauthorized = errors.New("hub authentication rejected")
@@ -37,12 +40,68 @@ type state struct {
 }
 
 type hubFrame struct {
-	Type      string `json:"type"`
-	Name      string `json:"name,omitempty"`
-	OS        string `json:"os,omitempty"`
-	Arch      string `json:"arch,omitempty"`
-	Shell     string `json:"shell,omitempty"`
-	ExpiresAt string `json:"expires_at,omitempty"`
+	Type           string               `json:"type"`
+	ReqID          string               `json:"req_id,omitempty"`
+	Error          string               `json:"error,omitempty"`
+	Name           string               `json:"name,omitempty"`
+	OS             string               `json:"os,omitempty"`
+	Arch           string               `json:"arch,omitempty"`
+	Shell          string               `json:"shell,omitempty"`
+	ExpiresAt      string               `json:"expires_at,omitempty"`
+	JobID          string               `json:"job_id,omitempty"`
+	Command        []string             `json:"command,omitempty"`
+	Cwd            string               `json:"cwd,omitempty"`
+	Env            []string             `json:"env,omitempty"`
+	TimeoutMS      int64                `json:"timeout_ms,omitempty"`
+	State          string               `json:"state,omitempty"`
+	ExitCode       *int                 `json:"exit_code,omitempty"`
+	Stdout         []byte               `json:"stdout,omitempty"`
+	Stderr         []byte               `json:"stderr,omitempty"`
+	Bytes          int64                `json:"bytes,omitempty"`
+	Offset         int64                `json:"offset,omitempty"`
+	Chunk          []byte               `json:"chunk,omitempty"`
+	EOF            bool                 `json:"eof,omitempty"`
+	TransferID     string               `json:"transfer_id,omitempty"`
+	Sources        []string             `json:"sources,omitempty"`
+	Excludes       []string             `json:"excludes,omitempty"`
+	TargetDir      string               `json:"target_dir,omitempty"`
+	Candidates     []transfer.Candidate `json:"candidates,omitempty"`
+	ExistingHashes map[string]string    `json:"existing_hashes,omitempty"`
+	StreamToken    string               `json:"stream_token,omitempty"`
+	Files          int                  `json:"files,omitempty"`
+	Skipped        int                  `json:"skipped,omitempty"`
+	TransferBytes  int64                `json:"transfer_bytes,omitempty"`
+	TotalBytes     int64                `json:"total_bytes,omitempty"`
+}
+
+type nodeRunner struct {
+	hubURL     string
+	token      string
+	httpClient *http.Client
+	jobs       *jobManager
+}
+
+type sessionConn struct {
+	conn       *websocket.Conn
+	writeMu    sync.Mutex
+	hubURL     string
+	token      string
+	httpClient *http.Client
+	jobs       *jobManager
+	healthy    atomic.Bool
+	rpcWG      sync.WaitGroup
+}
+
+func (s *sessionConn) send(ctx context.Context, frame hubFrame) error {
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("encode node frame: %w", err)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	writeCtx, cancel := context.WithTimeout(ctx, frameTimeout)
+	defer cancel()
+	return s.conn.Write(writeCtx, websocket.MessageText, payload)
 }
 
 func Run(ctx context.Context, config Config) error {
@@ -64,7 +123,13 @@ func Run(ctx context.Context, config Config) error {
 		return err
 	}
 	httpClient.CloseIdleConnections()
-	return maintainConnection(ctx, config.HubURL, creds.DeviceToken, httpClient)
+	jobs, err := newJobManager(ctx, config.StateDir, shell())
+	if err != nil {
+		return err
+	}
+	defer jobs.Close()
+	runner := &nodeRunner{hubURL: config.HubURL, token: creds.DeviceToken, httpClient: httpClient, jobs: jobs}
+	return runner.maintain(ctx)
 }
 
 func credentials(ctx context.Context, config Config, httpClient *http.Client) (state, error) {
@@ -154,13 +219,13 @@ func shell() string {
 	return "/bin/sh"
 }
 
-func maintainConnection(ctx context.Context, hubURL, token string, httpClient *http.Client) error {
+func (r *nodeRunner) maintain(ctx context.Context) error {
 	backoff := initialBackoff
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		healthy, err := connect(ctx, hubURL, token, httpClient)
+		healthy, err := r.connectOnce(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -177,15 +242,22 @@ func maintainConnection(ctx context.Context, hubURL, token string, httpClient *h
 	}
 }
 
-func connect(ctx context.Context, hubURL, token string, httpClient *http.Client) (bool, error) {
+func (r *nodeRunner) connectOnce(ctx context.Context) (bool, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, frameTimeout)
-	header := http.Header{"Authorization": []string{"Bearer " + token}}
-	conn, response, err := websocket.Dial(dialCtx, hubURL+"/v1/node", &websocket.DialOptions{HTTPClient: httpClient, HTTPHeader: header})
+	header := http.Header{"Authorization": []string{"Bearer " + r.token}}
+	conn, response, err := websocket.Dial(dialCtx, r.hubURL+"/v1/node", &websocket.DialOptions{HTTPClient: r.httpClient, HTTPHeader: header})
 	cancel()
 	if err != nil {
 		return false, dialError(response, err)
 	}
-	return runSession(ctx, conn)
+	session := &sessionConn{
+		conn:       conn,
+		hubURL:     r.hubURL,
+		token:      r.token,
+		httpClient: r.httpClient,
+		jobs:       r.jobs,
+	}
+	return session.run(ctx)
 }
 
 func dialError(response *http.Response, err error) error {
@@ -198,23 +270,27 @@ func dialError(response *http.Response, err error) error {
 	return fmt.Errorf("connect to hub: %w", err)
 }
 
-func runSession(ctx context.Context, conn *websocket.Conn) (bool, error) {
-	conn.SetReadLimit(4096)
-	var healthy atomic.Bool
+func (s *sessionConn) run(ctx context.Context) (bool, error) {
+	s.conn.SetReadLimit(maxFrameBytes)
+	sessionCtx, cancel := context.WithCancel(ctx)
+	s.jobs.setNotifier(func(frame hubFrame) {
+		_ = s.send(sessionCtx, frame)
+	})
 	readDone := make(chan error, 1)
 	go func() {
 		defer close(readDone)
-		readDone <- readFrames(ctx, conn, &healthy)
+		readDone <- s.readFrames(sessionCtx)
 	}()
-	defer func() {
-		_ = conn.CloseNow()
-		<-readDone
-	}()
-	err := writeHeartbeats(ctx, conn, readDone)
-	return healthy.Load(), err
+	err := s.writeHeartbeats(sessionCtx, readDone)
+	cancel()
+	_ = s.conn.CloseNow()
+	<-readDone
+	s.rpcWG.Wait()
+	s.jobs.setNotifier(nil)
+	return s.healthy.Load(), err
 }
 
-func writeHeartbeats(ctx context.Context, conn *websocket.Conn, readDone <-chan error) error {
+func (s *sessionConn) writeHeartbeats(ctx context.Context, readDone <-chan error) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -225,35 +301,25 @@ func writeHeartbeats(ctx context.Context, conn *websocket.Conn, readDone <-chan 
 			return err
 		case <-ticker.C:
 		}
-		if err := writeFrame(ctx, conn, hubFrame{Type: "ping"}); err != nil {
+		if err := s.send(ctx, hubFrame{Type: "ping"}); err != nil {
 			return fmt.Errorf("write hub heartbeat: %w", err)
 		}
 	}
 }
 
-func writeFrame(ctx context.Context, conn *websocket.Conn, frame hubFrame) error {
-	payload, err := json.Marshal(frame)
-	if err != nil {
-		return fmt.Errorf("encode node frame: %w", err)
-	}
-	writeCtx, cancel := context.WithTimeout(ctx, frameTimeout)
-	defer cancel()
-	return conn.Write(writeCtx, websocket.MessageText, payload)
-}
-
-func readFrames(ctx context.Context, conn *websocket.Conn, healthy *atomic.Bool) error {
+func (s *sessionConn) readFrames(ctx context.Context) error {
 	for {
 		readCtx, cancel := context.WithTimeout(ctx, frameTimeout)
-		_, data, err := conn.Read(readCtx)
+		_, data, err := s.conn.Read(readCtx)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("read hub frame: %w", err)
 		}
-		handleFrame(data, healthy)
+		s.dispatch(ctx, data)
 	}
 }
 
-func handleFrame(data []byte, healthy *atomic.Bool) {
+func (s *sessionConn) dispatch(ctx context.Context, data []byte) {
 	var frame hubFrame
 	if err := json.Unmarshal(data, &frame); err != nil {
 		return
@@ -263,8 +329,62 @@ func handleFrame(data []byte, healthy *atomic.Bool) {
 		fmt.Printf("dl connected: name=%s status=alive platform=%s/%s shell=%s expires_at=%s\n",
 			frame.Name, frame.OS, frame.Arch, frame.Shell, frame.ExpiresAt)
 	case "pong":
-		healthy.Store(true)
+		s.healthy.Store(true)
+	case "exec_start", "job_status", "job_logs", "job_kill",
+		"transfer_scan", "transfer_inspect", "transfer_send", "transfer_recv":
+		s.rpcWG.Add(1)
+		go func() {
+			defer s.rpcWG.Done()
+			s.handleRPC(ctx, frame)
+		}()
 	}
+}
+
+func (s *sessionConn) handleRPC(ctx context.Context, frame hubFrame) {
+	switch frame.Type {
+	case "transfer_scan", "transfer_inspect", "transfer_send", "transfer_recv":
+		reply, postSend := s.executeTransferRPC(ctx, frame)
+		if s.send(ctx, reply) == nil && reply.Error == "" && postSend != nil {
+			postSend()
+		}
+	default:
+		_ = s.send(ctx, s.executeRPC(frame))
+	}
+}
+
+func (s *sessionConn) executeRPC(frame hubFrame) hubFrame {
+	reply := hubFrame{Type: "rpc_reply", ReqID: frame.ReqID, JobID: frame.JobID}
+	switch frame.Type {
+	case "exec_start":
+		setRPCError(&reply, s.jobs.start(frame))
+	case "job_status":
+		status, err := s.jobs.status(frame.JobID)
+		if !setRPCError(&reply, err) {
+			reply.State = status.State
+			reply.ExitCode = status.ExitCode
+			reply.Bytes = status.Bytes
+		}
+	case "job_logs":
+		chunk, eof, err := s.jobs.readLogs(frame.JobID, frame.Offset)
+		if !setRPCError(&reply, err) {
+			reply.Chunk = chunk
+			reply.EOF = eof
+		}
+	case "job_kill":
+		setRPCError(&reply, s.jobs.kill(frame.JobID))
+	}
+	return reply
+}
+
+func setRPCError(reply *hubFrame, err error) bool {
+	if err == nil {
+		return false
+	}
+	reply.Error = err.Error()
+	if errors.Is(err, os.ErrNotExist) {
+		reply.State = "not_found"
+	}
+	return true
 }
 
 func sleep(ctx context.Context, duration time.Duration) bool {

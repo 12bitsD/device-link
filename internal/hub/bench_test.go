@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/12bitsD/device-link/internal/registry"
-	"github.com/coder/websocket"
 )
 
 func BenchmarkHandleDevicesList(b *testing.B) {
@@ -33,7 +32,7 @@ func BenchmarkHandleDevicesList(b *testing.B) {
 			b.Fatal(joinErr)
 		}
 	}
-	server := &Server{store: store, live: make(map[int64]*websocket.Conn)}
+	server := &Server{store: store, live: make(map[int64]*nodeSession)}
 	handler := server.routes()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

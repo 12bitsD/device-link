@@ -16,7 +16,6 @@ import (
 
 	"github.com/12bitsD/device-link/internal/client"
 	"github.com/12bitsD/device-link/internal/registry"
-	"github.com/coder/websocket"
 )
 
 type Config struct {
@@ -26,11 +25,15 @@ type Config struct {
 }
 
 type Server struct {
-	store   *registry.Store
-	mu      sync.Mutex
-	live    map[int64]*websocket.Conn
-	closing bool
-	wg      sync.WaitGroup
+	store         *registry.Store
+	mu            sync.Mutex
+	live          map[int64]*nodeSession
+	onlineNotify  chan struct{}
+	jobWaiters    map[jobWaiterKey]chan nodeFrame
+	transfers     map[string]*hubTransfer
+	transferOrder []string
+	closing       bool
+	wg            sync.WaitGroup
 }
 
 func Run(ctx context.Context, config Config) error {
@@ -50,7 +53,7 @@ func Run(ctx context.Context, config Config) error {
 		return fmt.Errorf("listen on %s: %w", config.Addr, err)
 	}
 	fmt.Printf("DL_ADDR=%s\n", listener.Addr())
-	server := &Server{store: store, live: make(map[int64]*websocket.Conn)}
+	server := &Server{store: store}
 	return serve(ctx, listener, server, config.StateDir)
 }
 
@@ -135,10 +138,24 @@ func (s *Server) routes() http.Handler {
 	controllerMux.HandleFunc("GET /v1/devices", s.handleDevices)
 	controllerMux.HandleFunc("PUT /v1/devices/{name}/ttl", s.handleTTL)
 	controllerMux.HandleFunc("DELETE /v1/devices/{name}", s.handleDelete)
+	controllerMux.HandleFunc("POST /v1/devices/{name}/exec", s.handleExec)
+	controllerMux.HandleFunc("GET /v1/jobs/{id}", s.handleJobStatus)
+	controllerMux.HandleFunc("GET /v1/jobs/{id}/logs", s.handleJobLogs)
+	controllerMux.HandleFunc("POST /v1/jobs/{id}/kill", s.handleJobKill)
+	controllerMux.HandleFunc("POST /v1/transfers/scan", s.handleTransferScan)
+	controllerMux.HandleFunc("POST /v1/transfers", s.handleStartTransfer)
+	controllerMux.HandleFunc("PUT /v1/transfers/{id}/upload", s.handleControllerUpload)
+	controllerMux.HandleFunc("GET /v1/transfers/{id}/download", s.handleControllerDownload)
+	controllerMux.HandleFunc("POST /v1/transfers/{id}/complete", s.handleControllerComplete)
+	controllerMux.HandleFunc("GET /v1/transfers/{id}", s.handleTransferStatus)
+	controllerMux.HandleFunc("POST /v1/transfers/{id}/cancel", s.handleTransferCancel)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("/v1/node", s.handleNode)
+	mux.HandleFunc("PUT /v1/node-transfers/{id}/upload", s.handleNodeUpload)
+	mux.HandleFunc("GET /v1/node-transfers/{id}/download", s.handleNodeDownload)
+	mux.HandleFunc("POST /v1/node-transfers/{id}/done", s.handleNodeTransferDone)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorizeController(w, r) {
 			return
@@ -296,6 +313,7 @@ func (s *Server) handleTTL(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	s.notifyDeviceStateChange()
 	writeJSON(w, http.StatusOK, map[string]string{"name": name})
 }
 

@@ -53,19 +53,30 @@ func TestStage1DecoupledReadAndBackoffReset(t *testing.T) {
 
 func TestStage1LinuxContainerJoinAndLS(t *testing.T) {
 	dockerBin, linuxArch := requireLinuxContainerEnv(t)
-	stageDir := t.TempDir()
-	linuxBin := buildLinuxDLBinary(t, stageDir, linuxArch)
+	stageDir := newContainerStageDir(t)
+	buildLinuxDLBinary(t, stageDir, linuxArch)
 
 	h, containerHubURL := startContainerTestHub(t)
+	stageContainerCA(t, h.caPath, stageDir)
 	code := mintContainerInviteCode(t, h)
 
 	containerName := fmt.Sprintf("dl-e2e-linux-%d-%d", os.Getpid(), time.Now().UnixNano())
 	t.Cleanup(func() { removeDockerContainer(dockerBin, containerName) })
-	prepareLinuxJoinContainer(t, containerSetup{
-		dockerBin: dockerBin, name: containerName, hubURL: containerHubURL,
-		code: code, linuxBin: linuxBin, caPath: h.caPath,
-	})
-	containerProc := startProcess(t, dockerBin, "start", "-a", containerName)
+	containerProc := startProcess(
+		t,
+		dockerBin,
+		"run", "--rm",
+		"--name", containerName,
+		"--add-host=host.docker.internal:host-gateway",
+		"--tmpfs", "/tmp:rw,exec,size=32m",
+		"-v", stageDir+":/work:ro",
+		"node:24-alpine",
+		"/work/dl", "join",
+		"--hub", containerHubURL,
+		"--code", code,
+		"--ca", "/work/cert.pem",
+		"--state-dir", "/tmp/dl-node",
+	)
 
 	dev := h.waitDevice(t, "linux-node", "alive")
 	assertLinuxContainerDevice(t, dev, linuxArch)
@@ -327,55 +338,51 @@ func mapContainerArch(raw string) (string, bool) {
 	}
 }
 
-func buildLinuxDLBinary(t *testing.T, stageDir, linuxArch string) string {
+func newContainerStageDir(t *testing.T) string {
 	t.Helper()
-	workDir, err := os.Getwd()
+	benchDir := filepath.Clean(filepath.Join("..", "..", ".bench"))
+	if err := os.MkdirAll(benchDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(benchDir, "e2e-linux-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Clean(filepath.Join(workDir, "..", ".."))
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return absDir
+}
+
+func stageContainerCA(t *testing.T, caPath, stageDir string) {
+	t.Helper()
+	certBytes, err := os.ReadFile(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "cert.pem"), certBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func buildLinuxDLBinary(t *testing.T, stageDir, linuxArch string) {
+	t.Helper()
 	outBin := filepath.Join(stageDir, "dl")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", outBin, "./cmd/dl")
-	cmd.Dir = root
+	cmd := exec.CommandContext(ctx, "go", "build", "-ldflags=-s -w", "-o", outBin, "./cmd/dl")
+	cmd.Dir = filepath.Join("..", "..")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+linuxArch)
 	if output, buildErr := cmd.CombinedOutput(); buildErr != nil {
 		t.Fatalf("cross-compile linux/%s dl: %v\n%s", linuxArch, buildErr, output)
 	}
 	if chmodErr := os.Chmod(outBin, 0o755); chmodErr != nil {
 		t.Fatal(chmodErr)
-	}
-	return outBin
-}
-
-type containerSetup struct {
-	dockerBin string
-	name      string
-	hubURL    string
-	code      string
-	linuxBin  string
-	caPath    string
-}
-
-func prepareLinuxJoinContainer(t *testing.T, setup containerSetup) {
-	t.Helper()
-	runDockerSetup(t, setup.dockerBin,
-		"create", "--name", setup.name,
-		"--add-host=host.docker.internal:host-gateway",
-		"node:24-alpine",
-		"/tmp/dl", "join", "--hub", setup.hubURL, "--code", setup.code, "--ca", "/tmp/cert.pem", "--state-dir", "/tmp/dl-node",
-	)
-	runDockerSetup(t, setup.dockerBin, "cp", setup.linuxBin, setup.name+":/tmp/dl")
-	runDockerSetup(t, setup.dockerBin, "cp", setup.caPath, setup.name+":/tmp/cert.pem")
-}
-
-func runDockerSetup(t *testing.T, dockerBin string, args ...string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if output, err := exec.CommandContext(ctx, dockerBin, args...).CombinedOutput(); err != nil {
-		t.Fatalf("docker %v: %v\n%s", args, err, output)
 	}
 }
 

@@ -26,23 +26,53 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 
 ## 3. Remote Shell (`Exec` only, Stage 2)
 
-- Non-interactive `exec` with the target user's normal login `PATH`; `stdin` closed by default.
-- Timeout or `kill` terminates the whole process tree (Unix process group `pgid` / Windows Job Object).
-- Every run gets a `job_id`; output is spooled to a temp log on the node.
-  - Finishes within `--wait` window: synchronous return of `stdout` / `stderr` / `exit_code`.
-  - Exceeds `--wait` or `--detach`: returns `job_id`.
-- If the node loses network mid-job, the local process keeps running and caching output; after reconnect, the controller resumes reading via `dl job logs <job_id> --offset <bytes>`.
-- `dl exec --wait-online` optionally waits briefly for an offline device to reconnect.
+- **CLI Surface**:
+  - `dl exec [controller-flags] [--cwd <dir>] [--env KEY=VALUE]... [--wait <duration>] [--timeout <duration>] [--wait-online <duration>] [--detach] <device> [--] <command> [args...]`
+  - `dl job status [controller-flags] [--json] <job_id>`
+  - `dl job logs [controller-flags] [--offset <bytes>] <job_id>` (flags such as `--offset` and `--json` are accepted either before or after `<job_id>`)
+  - `dl job kill [controller-flags] <job_id>`
+- **Execution Environment & Invocation**:
+  - Non-interactive `exec` loads the target user's normal login `PATH` (unless explicitly overridden via `--env PATH=...`) and closes `stdin` (`EOF` immediately) by default.
+  - `--cwd <dir>` sets the remote working directory (fails non-zero if missing/invalid); `--env KEY=VALUE` (repeatable) sets environment variables for the job.
+  - When a single `<command>` argument is given, the node executes it via its shell (`<shell> -c <command>` on Unix; `cmd.exe /d /s /c` or `powershell.exe -NoProfile -NonInteractive -Command` on Windows). When multiple arguments (`<prog> <args...>`) are given, the node executes `<prog>` directly with `<args...>` resolved against the job `PATH`.
+- **Synchronous vs. Detached Lifecycle**:
+  - Every run gets a `job_id` and spools combined output in write order to `<node-state-dir>/jobs/<job_id>.log` on the node.
+  - Finishes within `--wait` (default `10s`, when `--detach` is not set): writes remote `stdout` to controller `stdout` and remote `stderr` to controller `stderr` verbatim. Exits `0` on `completed`, exits with the remote command's non-zero `exit_code` on `failed`, prints `dl: job <job_id> timed out` to stderr and exits `124` on `timed_out`, and prints `dl: job <job_id> killed` to stderr and exits `137` on `killed`.
+  - Exceeds `--wait` or `--detach` is set (or the node disconnects after starting the job): prints a single line `job_id=<job_id>` to `stdout` and exits `0` while the job continues running on the node.
+- **Process-Tree Kill & Timeout**:
+  - `--timeout <duration>` (enforced on the node) or `dl job kill <job_id>` terminates the entire process tree (Unix process group `pgid` / Windows Job Object), killing children and grandchildren.
+- **Status, Offline Continuation & Log Resume**:
+  - `dl job status <job_id>` prints `job_id=<job_id> device=<device> state=<running|completed|failed|killed|timed_out> exit_code=<int|none> bytes=<int>` (or `{"job_id":...,"device":...,"state":...,"exit_code":<int|null>,"bytes":<int>}` with `--json`).
+  - If the node loses network mid-job, the local process keeps running and spooling output to disk; after reconnect, the controller inspects completion via `dl job status <job_id>` and resumes reading raw output bytes via `dl job logs <job_id> --offset <bytes>`.
+  - `dl exec --wait-online <duration>` waits up to `<duration>` for a registered offline (`missed`) device to reconnect before dispatching; if still offline, fails non-zero with an `offline` error (`503`), distinct from unknown device (`404`), unauthorized (`401`/`403`), timeout (`124`), and command non-zero exit.
+  - All controller `/v1/...` routes for `exec` and `job` reject `device_token` with `401`/`403` fail-closed.
 
 ## 4. File Transfer (`<= 500MB`, Stage 3)
 
-- Four unambiguous elements: `from + sources[] -> to + target_dir`.
-  - CLI: `dl cp [from:]<src>... [to:]<target_dir>` (omitted prefix means controller-local `local`).
-  - Supports `A->B`, `local->B`, `A->local`; single file, directory, or multiple paths copied by base name into `target_dir`; `--exclude` patterns.
-- Pre-flight source size scan rejects `> 500MB` before streaming and lists the largest offending files.
-- Same-name target files compared by SHA-256: identical skipped, different overwritten by default while preserving `+x` permission bits.
-- Transferred via independent HTTP `tar` streams piped in-memory through the Hub (zero Hub disk spool; large transfers never block the WebSocket control channel).
-- Slow transfers return a `transfer_id` for `dl transfer status` / `dl transfer cancel`.
+- **CLI Surface**:
+  - `dl cp [controller-flags] [--exclude <pattern>]... [--wait <duration>] [--detach] [from:]<src>... [to:]<target_dir>`
+  - `dl transfer status [controller-flags] [--json] <transfer_id>`
+  - `dl transfer cancel [controller-flags] <transfer_id>`
+  - Flags (`--exclude`, `--wait`, `--detach`, `--json`, plus controller flags `--hub`, `--token`, `--ca`, `--state-dir`) are accepted before, between, or after positional arguments.
+- **Endpoint & Path Model (`from + sources[] -> to + target_dir`)**:
+  - Requires at least two positional arguments: one or more `<src>` paths followed by `<target_dir>`.
+  - Endpoint syntax: a path with no `<device>:` prefix, a `local:<path>` prefix, or a Windows drive path (`C:\...` / `C:/...`) refers to the controller (`local`); `<device>:<path>` refers to remote device `<device>`.
+  - All `<src>...` arguments must resolve to the same `from` endpoint (mixing source endpoints fails non-zero). At least one of `from` or `to` must be a remote device (`local -> local` fails non-zero); supports `A->B`, `local->B`, and `A->local`.
+  - Every `<src>` (single file, directory, or multiple paths) is copied by its base name (`filepath.Base`) into `<target_dir>` (`<target_dir>/<base>`), creating `<target_dir>` if needed.
+  - `--exclude <pattern>` (repeatable) matches glob patterns against each entry's base name or slash-normalized relative path, skipping matching files and directory subtrees during both pre-flight sizing and transfer.
+- **Pre-Flight `<= 500MB` Scan**:
+  - Before opening any HTTP `tar` stream or writing to `<target_dir>`, the source sums non-excluded regular file sizes.
+  - If total size exceeds `500 MiB` (`524,288,000` bytes), `dl cp` fails non-zero before streaming any payload and prints an error to stderr containing `exceeds 500MB limit` and listing the largest offending files (relative path and byte size, largest first).
+- **Same-Name SHA-256 Skip & `+x` Permission Bits**:
+  - Same-name regular files under `<target_dir>` are compared by SHA-256 before streaming file bytes: identical files are skipped without streaming payload bytes or rewriting target disk (`skipped` count increments); missing or differing files are written/overwritten while preserving executable bits (`0755` when source has any `+x` bit, `0644` otherwise).
+- **Path-Traversal & Symlink Escape Defense**:
+  - Source scan and target extraction block `..` path segments, absolute archive paths, symlinks whose target resolves outside the source root or `<target_dir>`, and writes through pre-existing symlinks under `<target_dir>` that resolve outside `<target_dir>`, failing non-zero before any out-of-bounds disk write.
+- **Zero-Disk Hub HTTP `tar` Relay, Concurrency & Lifecycle**:
+  - File payloads stream via independent HTTP `tar` requests piped in-memory through the Hub (zero Hub disk spool files), never blocking the WebSocket control channel or concurrent `dl exec` on the same node during slow/throttled transfers.
+  - Synchronous completion within `--wait` (default `30s`, when `--detach` is not set) prints `transfer_id=<id> state=completed files=<copied> skipped=<skipped> bytes=<transferred>/<total>` to stdout and exits `0`.
+  - On `A->B` (remote-to-remote), `--detach` or exceeding `--wait` prints `transfer_id=<id>` to stdout and exits `0` while nodes `A` and `B` continue streaming via the Hub (`--detach` on `local->B` or `A->local` fails non-zero).
+  - `dl transfer status <transfer_id>` prints `transfer_id=<id> from=<from> to=<to> state=<running|completed|failed|cancelled> files=<copied> skipped=<skipped> bytes=<transferred>/<total>` (or `{"transfer_id":...,"from":...,"to":...,"state":...,"files":<int>,"skipped":<int>,"bytes":<int>,"total_bytes":<int>}` with `--json`).
+  - `dl transfer cancel <transfer_id>` aborts an in-flight transfer (`state=cancelled`, exit `0`). Unknown `<transfer_id>` fails non-zero (`404`), offline source/target device fails non-zero (`503` `offline`), and all controller `/v1/transfers...` routes reject `device_token` with `401`/`403` fail-closed.
 
 ## 5. Architecture & CLI Surface (13 Subcommands)
 

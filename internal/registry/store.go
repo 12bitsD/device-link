@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS devices (
  shell TEXT NOT NULL,
  expires_at TEXT,
  last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobs (
+ id TEXT PRIMARY KEY,
+ device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE
 );`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate registry: %w", err)
@@ -275,6 +279,49 @@ FROM devices WHERE token_hash = ?`
 	}
 	if device.ExpiresAt != nil && !device.ExpiresAt.After(time.Now()) {
 		return Device{}, ErrUnauthorized
+	}
+	return device, nil
+}
+
+func (s *Store) DeviceByName(ctx context.Context, name string) (Device, error) {
+	const query = `SELECT id, name, os, arch, shell, expires_at, last_seen
+FROM devices WHERE name = ?`
+	device, err := scanDevice(s.db.QueryRowContext(ctx, query, name))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Device{}, ErrNotFound
+	}
+	if err != nil {
+		return Device{}, fmt.Errorf("read device %s: %w", name, err)
+	}
+	return device, nil
+}
+
+func (s *Store) CreateJob(ctx context.Context, deviceID int64) (string, error) {
+	raw, err := newToken()
+	if err != nil {
+		return "", err
+	}
+	jobID := "job_" + raw[:20]
+	const query = "INSERT INTO jobs(id, device_id) SELECT ?, id FROM devices WHERE id = ?"
+	result, err := s.db.ExecContext(ctx, query, jobID, deviceID)
+	if err != nil {
+		return "", fmt.Errorf("create job: %w", err)
+	}
+	if err := requireOneRow(result); err != nil {
+		return "", err
+	}
+	return jobID, nil
+}
+
+func (s *Store) JobDevice(ctx context.Context, jobID string) (Device, error) {
+	const query = `SELECT d.id, d.name, d.os, d.arch, d.shell, d.expires_at, d.last_seen
+FROM jobs j JOIN devices d ON d.id = j.device_id WHERE j.id = ?`
+	device, err := scanDevice(s.db.QueryRowContext(ctx, query, jobID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Device{}, ErrNotFound
+	}
+	if err != nil {
+		return Device{}, fmt.Errorf("read job %s: %w", jobID, err)
 	}
 	return device, nil
 }
