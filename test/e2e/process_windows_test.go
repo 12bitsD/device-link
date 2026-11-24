@@ -3,7 +3,7 @@
 package e2e
 
 import (
-	"os"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -32,9 +32,8 @@ func terminateProcessTree(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return nil
 	}
-	err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(cmd.Process.Pid))
-	if err != nil {
-		return cmd.Process.Signal(os.Interrupt)
+	if err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(cmd.Process.Pid)); err != nil {
+		return fmt.Errorf("generate ctrl-break: %w", err)
 	}
 	return nil
 }

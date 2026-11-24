@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -17,8 +18,6 @@ import (
 	"github.com/12bitsD/device-link/internal/registry"
 	"github.com/coder/websocket"
 )
-
-const heartbeatInterval = time.Second
 
 type Config struct {
 	Addr     string
@@ -42,13 +41,12 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	if err := initializeState(config.StateDir, config.Host, store); err != nil {
-		_ = store.Close()
+	defer func() { _ = store.Close() }()
+	if err := initializeState(ctx, config.StateDir, config.Host, store); err != nil {
 		return err
 	}
 	listener, err := net.Listen("tcp", config.Addr)
 	if err != nil {
-		_ = store.Close()
 		return fmt.Errorf("listen on %s: %w", config.Addr, err)
 	}
 	fmt.Printf("DL_ADDR=%s\n", listener.Addr())
@@ -56,17 +54,10 @@ func Run(ctx context.Context, config Config) error {
 	return serve(ctx, listener, server, config.StateDir)
 }
 
-func initializeState(stateDir, host string, store *registry.Store) error {
-	token, err := store.ControllerToken(context.Background())
+func initializeState(ctx context.Context, stateDir, host string, store *registry.Store) error {
+	token, err := ensureControllerToken(ctx, filepath.Join(stateDir, "controller_token"), store)
 	if err != nil {
 		return err
-	}
-	tokenPath := filepath.Join(stateDir, "controller_token")
-	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
-		return fmt.Errorf("write controller token: %w", err)
-	}
-	if err := os.Chmod(tokenPath, 0o600); err != nil {
-		return fmt.Errorf("secure controller token: %w", err)
 	}
 	if err := ensureCertificate(stateDir, host); err != nil {
 		return err
@@ -75,16 +66,50 @@ func initializeState(stateDir, host string, store *registry.Store) error {
 	return nil
 }
 
+func ensureControllerToken(ctx context.Context, tokenPath string, store *registry.Store) (string, error) {
+	raw, err := os.ReadFile(tokenPath)
+	if err == nil {
+		token := strings.TrimSpace(string(raw))
+		ok, checkErr := store.HasControllerToken(ctx, token)
+		if checkErr != nil {
+			return "", checkErr
+		}
+		if !ok {
+			return "", fmt.Errorf("controller token in %s does not match registry", tokenPath)
+		}
+		if chmodErr := os.Chmod(tokenPath, 0o600); chmodErr != nil {
+			return "", fmt.Errorf("secure controller token: %w", chmodErr)
+		}
+		return token, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("read controller token: %w", err)
+	}
+	token, err := store.MintControllerToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("write controller token: %w", err)
+	}
+	if err := os.Chmod(tokenPath, 0o600); err != nil {
+		return "", fmt.Errorf("secure controller token: %w", err)
+	}
+	return token, nil
+}
+
 func serve(ctx context.Context, listener net.Listener, server *Server, stateDir string) error {
-	httpServer := &http.Server{Handler: server.routes(), ReadHeaderTimeout: 5 * time.Second}
+	httpServer := &http.Server{
+		Handler:           server.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
 	serveErr := make(chan error, 1)
 	go func() {
 		defer close(serveErr)
 		serveErr <- httpServer.ServeTLS(listener, filepath.Join(stateDir, "cert.pem"), filepath.Join(stateDir, "key.pem"))
 	}()
-	runCtx, cancel := context.WithCancel(ctx)
-	server.wg.Add(1)
-	go server.expiryLoop(runCtx)
 	var runErr error
 	select {
 	case <-ctx.Done():
@@ -93,52 +118,33 @@ func serve(ctx context.Context, listener net.Listener, server *Server, stateDir 
 			runErr = fmt.Errorf("serve HTTPS: %w", err)
 		}
 	}
-	cancel()
+	server.closeConnections()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		_ = httpServer.Close()
 	}
-	server.closeConnections()
 	server.wg.Wait()
 	<-serveErr
-	if err := server.store.Close(); err != nil && runErr == nil {
-		runErr = err
-	}
 	return runErr
 }
 
-func (s *Server) expiryLoop(ctx context.Context) {
-	defer s.wg.Done()
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.disconnectExpired(ctx)
-		}
-	}
-}
-
-func (s *Server) disconnectExpired(ctx context.Context) {
-	ids, err := s.store.ExpiredIDs(ctx)
-	if err != nil {
-		return
-	}
-	for _, id := range ids {
-		s.closeDevice(id)
-	}
-}
-
 func (s *Server) routes() http.Handler {
+	controllerMux := http.NewServeMux()
+	controllerMux.HandleFunc("POST /v1/invites", s.handleInvites)
+	controllerMux.HandleFunc("GET /v1/devices", s.handleDevices)
+	controllerMux.HandleFunc("PUT /v1/devices/{name}/ttl", s.handleTTL)
+	controllerMux.HandleFunc("DELETE /v1/devices/{name}", s.handleDelete)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/invites", s.handleInvites)
-	mux.HandleFunc("/v1/join", s.handleJoin)
-	mux.HandleFunc("/v1/devices", s.handleDevices)
-	mux.HandleFunc("/v1/devices/", s.handleDevice)
+	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("/v1/node", s.handleNode)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorizeController(w, r) {
+			return
+		}
+		controllerMux.ServeHTTP(w, r)
+	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.beginRequest() {
 			writeError(w, http.StatusServiceUnavailable, "hub is shutting down")
@@ -163,29 +169,56 @@ func (s *Server) authorizeController(w http.ResponseWriter, r *http.Request) boo
 }
 
 func bearerToken(r *http.Request) string {
-	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return ""
+	}
+	return token
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	return json.NewDecoder(r.Body).Decode(dst)
+}
+
+func validDeviceName(name string) bool {
+	if name == "" || len(name) > 63 || name == "local" {
+		return false
+	}
+	for i, ch := range name {
+		isAlnum := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+		isPunct := i > 0 && (ch == '-' || ch == '_' || ch == '.')
+		if !isAlnum && !isPunct {
+			return false
+		}
+	}
+	return true
+}
+
+func parseTTLSeconds(seconds *int64) (*time.Time, bool) {
+	if seconds == nil {
+		return nil, true
+	}
+	if *seconds < 0 || *seconds > math.MaxInt64/int64(time.Second) {
+		return nil, false
+	}
+	expiry := time.Now().Add(time.Duration(*seconds) * time.Second)
+	return &expiry, true
 }
 
 func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeController(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	var request struct {
 		Name       string `json:"name"`
 		TTLSeconds *int64 `json:"ttl_seconds"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+	if err := decodeJSON(w, r, &request); err != nil || !validDeviceName(request.Name) {
+		writeError(w, http.StatusBadRequest, "valid device name is required")
 		return
 	}
-	var deviceExpiry *time.Time
-	if request.TTLSeconds != nil {
-		value := time.Now().Add(time.Duration(*request.TTLSeconds) * time.Second)
-		deviceExpiry = &value
+	deviceExpiry, ok := parseTTLSeconds(request.TTLSeconds)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid TTL")
+		return
 	}
 	code, err := s.store.CreateInvite(r.Context(), request.Name, deviceExpiry)
 	if err != nil {
@@ -196,17 +229,13 @@ func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	var request struct {
 		Code  string `json:"code"`
 		OS    string `json:"os"`
 		Arch  string `json:"arch"`
 		Shell string `json:"shell"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid join request")
 		return
 	}
@@ -224,13 +253,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeController(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	devices, err := s.store.List(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list devices")
@@ -256,36 +278,20 @@ func (s *Server) viewDevice(device registry.Device) client.Device {
 	return client.Device{Name: device.Name, Status: status, OS: device.OS, Arch: device.Arch, Shell: device.Shell, ExpiresAt: expiry, LastSeen: device.LastSeen.UTC().Format(time.RFC3339)}
 }
 
-func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeController(w, r) {
-		return
-	}
-	nameAction := strings.TrimPrefix(r.URL.Path, "/v1/devices/")
-	parts := strings.Split(nameAction, "/")
-	if len(parts) == 2 && parts[1] == "ttl" && r.Method == http.MethodPut {
-		s.handleTTL(w, r, parts[0])
-		return
-	}
-	if len(parts) == 1 && r.Method == http.MethodDelete {
-		s.handleDelete(w, r, parts[0])
-		return
-	}
-	writeError(w, http.StatusNotFound, "not found")
-}
-
-func (s *Server) handleTTL(w http.ResponseWriter, r *http.Request, name string) {
+func (s *Server) handleTTL(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		TTLSeconds *int64 `json:"ttl_seconds"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || (request.TTLSeconds != nil && *request.TTLSeconds < 0) {
+	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid TTL")
 		return
 	}
-	var expiry *time.Time
-	if request.TTLSeconds != nil {
-		value := time.Now().Add(time.Duration(*request.TTLSeconds) * time.Second)
-		expiry = &value
+	expiry, ok := parseTTLSeconds(request.TTLSeconds)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid TTL")
+		return
 	}
+	name := r.PathValue("name")
 	if err := s.store.SetExpiry(r.Context(), name, expiry); err != nil {
 		writeStoreError(w, err)
 		return
@@ -293,8 +299,8 @@ func (s *Server) handleTTL(w http.ResponseWriter, r *http.Request, name string) 
 	writeJSON(w, http.StatusOK, map[string]string{"name": name})
 }
 
-func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, name string) {
-	id, err := s.store.Delete(r.Context(), name)
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := s.store.Delete(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeStoreError(w, err)
 		return

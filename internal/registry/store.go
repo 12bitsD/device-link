@@ -9,15 +9,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	// Register pure-Go SQLite driver with database/sql.
 	_ "modernc.org/sqlite"
 )
 
-const inviteLifetime = 10 * time.Minute
+const (
+	inviteLifetime = 10 * time.Minute
+	timeFormat     = "2006-01-02T15:04:05.000000000Z"
+)
 
 var (
 	ErrUnauthorized = errors.New("registry: unauthorized")
@@ -80,22 +81,20 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE TABLE IF NOT EXISTS devices (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
  token_hash TEXT NOT NULL UNIQUE,
- requested_name TEXT NOT NULL,
  name TEXT NOT NULL UNIQUE,
  os TEXT NOT NULL,
  arch TEXT NOT NULL,
  shell TEXT NOT NULL,
  expires_at TEXT,
  last_seen TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_devices_requested_name ON devices(requested_name);`
+);`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate registry: %w", err)
 	}
 	return nil
 }
 
-func Token() (string, error) {
+func newToken() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate token: %w", err)
@@ -103,26 +102,37 @@ func Token() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func HashToken(token string) string {
+func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) ControllerToken(ctx context.Context) (string, error) {
-	var token string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'controller_token'").Scan(&token)
-	if err == nil {
-		return token, nil
+func formatOptionalTime(value *time.Time) any {
+	if value == nil {
+		return nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("read controller token: %w", err)
+	return value.UTC().Format(timeFormat)
+}
+
+func parseOptionalTime(raw sql.NullString) (*time.Time, error) {
+	if !raw.Valid {
+		return nil, nil
 	}
-	token, err = Token()
+	parsed, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func (s *Store) MintControllerToken(ctx context.Context) (string, error) {
+	token, err := newToken()
 	if err != nil {
 		return "", err
 	}
-	hash := HashToken(token)
-	if _, err := s.db.ExecContext(ctx, "INSERT INTO settings(key, value) VALUES('controller_token', ?)", hash); err != nil {
+	const query = `INSERT INTO settings(key, value) VALUES('controller_token', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+	if _, err := s.db.ExecContext(ctx, query, hashToken(token)); err != nil {
 		return "", fmt.Errorf("store controller token: %w", err)
 	}
 	return token, nil
@@ -137,21 +147,17 @@ func (s *Store) HasControllerToken(ctx context.Context, token string) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("read controller token: %w", err)
 	}
-	return token != "" && found == HashToken(token), nil
+	return token != "" && found == hashToken(token), nil
 }
 
 func (s *Store) CreateInvite(ctx context.Context, name string, deviceExpiry *time.Time) (string, error) {
-	token, err := Token()
+	token, err := newToken()
 	if err != nil {
 		return "", err
 	}
-	expires := time.Now().Add(inviteLifetime).UTC().Format(time.RFC3339Nano)
-	var deviceExpiryText any
-	if deviceExpiry != nil {
-		deviceExpiryText = deviceExpiry.UTC().Format(time.RFC3339Nano)
-	}
+	expires := time.Now().Add(inviteLifetime).UTC().Format(timeFormat)
 	const query = "INSERT INTO invites(token_hash, name, expires_at, device_expires_at) VALUES(?, ?, ?, ?)"
-	if _, err := s.db.ExecContext(ctx, query, HashToken(token), name, expires, deviceExpiryText); err != nil {
+	if _, err := s.db.ExecContext(ctx, query, hashToken(token), name, expires, formatOptionalTime(deviceExpiry)); err != nil {
 		return "", fmt.Errorf("create invite: %w", err)
 	}
 	return token, nil
@@ -163,11 +169,11 @@ func (s *Store) ExchangeInvite(ctx context.Context, code string, platform Platfo
 		return Credential{}, fmt.Errorf("begin invite exchange: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	invite, err := consumeInvite(ctx, tx, code)
+	inv, err := consumeInvite(ctx, tx, code)
 	if err != nil {
 		return Credential{}, err
 	}
-	credential, err := insertDevice(ctx, tx, invite, platform)
+	credential, err := insertDevice(ctx, tx, inv, platform)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -187,7 +193,7 @@ func consumeInvite(ctx context.Context, tx *sql.Tx, code string) (invite, error)
 	var expiresText string
 	var deviceExpiry sql.NullString
 	const query = "DELETE FROM invites WHERE token_hash = ? RETURNING name, expires_at, device_expires_at"
-	err := tx.QueryRowContext(ctx, query, HashToken(code)).Scan(&result.name, &expiresText, &deviceExpiry)
+	err := tx.QueryRowContext(ctx, query, hashToken(code)).Scan(&result.name, &expiresText, &deviceExpiry)
 	if errors.Is(err, sql.ErrNoRows) {
 		return invite{}, ErrUnauthorized
 	}
@@ -201,18 +207,15 @@ func consumeInvite(ctx context.Context, tx *sql.Tx, code string) (invite, error)
 	if !expires.After(time.Now()) {
 		return invite{}, ErrUnauthorized
 	}
-	if deviceExpiry.Valid {
-		parsed, parseErr := time.Parse(time.RFC3339Nano, deviceExpiry.String)
-		if parseErr != nil {
-			return invite{}, fmt.Errorf("parse invited device expiry: %w", parseErr)
-		}
-		result.deviceExpiry = &parsed
+	result.deviceExpiry, err = parseOptionalTime(deviceExpiry)
+	if err != nil {
+		return invite{}, fmt.Errorf("parse invited device expiry: %w", err)
 	}
 	return result, nil
 }
 
 func insertDevice(ctx context.Context, tx *sql.Tx, inv invite, platform Platform) (Credential, error) {
-	token, err := Token()
+	token, err := newToken()
 	if err != nil {
 		return Credential{}, err
 	}
@@ -220,14 +223,10 @@ func insertDevice(ctx context.Context, tx *sql.Tx, inv invite, platform Platform
 	if err != nil {
 		return Credential{}, err
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	var expiry any
-	if inv.deviceExpiry != nil {
-		expiry = inv.deviceExpiry.UTC().Format(time.RFC3339Nano)
-	}
-	const query = `INSERT INTO devices(token_hash, requested_name, name, os, arch, shell, expires_at, last_seen)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err = tx.ExecContext(ctx, query, HashToken(token), inv.name, name, platform.OS, platform.Arch, platform.Shell, expiry, now)
+	now := time.Now().UTC().Format(timeFormat)
+	const query = `INSERT INTO devices(token_hash, name, os, arch, shell, expires_at, last_seen)
+VALUES(?, ?, ?, ?, ?, ?, ?)`
+	_, err = tx.ExecContext(ctx, query, hashToken(token), name, platform.OS, platform.Arch, platform.Shell, formatOptionalTime(inv.deviceExpiry), now)
 	if err != nil {
 		return Credential{}, fmt.Errorf("insert device: %w", err)
 	}
@@ -235,43 +234,38 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
 }
 
 func availableName(ctx context.Context, tx *sql.Tx, requested string) (string, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT name FROM devices WHERE requested_name = ?", requested)
+	prefix := requested + "-"
+	rows, err := tx.QueryContext(ctx, "SELECT name FROM devices WHERE name = ? OR substr(name, 1, ?) = ?", requested, len(prefix), prefix)
 	if err != nil {
 		return "", fmt.Errorf("check device names: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	maxSuffix := 0
+	taken := make(map[string]struct{})
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return "", fmt.Errorf("scan device name: %w", err)
 		}
-		maxSuffix = max(maxSuffix, nameSuffix(name, requested))
+		taken[name] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("iterate device names: %w", err)
 	}
-	if maxSuffix == 0 {
+	if _, used := taken[requested]; !used {
 		return requested, nil
 	}
-	return fmt.Sprintf("%s-%d", requested, maxSuffix+1), nil
-}
-
-func nameSuffix(name, requested string) int {
-	if name == requested {
-		return 1
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s-%d", requested, suffix)
+		if _, used := taken[candidate]; !used {
+			return candidate, nil
+		}
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(name, requested+"-"))
-	if err != nil || n < 1 {
-		return 0
-	}
-	return n
 }
 
 func (s *Store) DeviceByToken(ctx context.Context, token string) (Device, error) {
 	const query = `SELECT id, name, os, arch, shell, expires_at, last_seen
 FROM devices WHERE token_hash = ?`
-	row := s.db.QueryRowContext(ctx, query, HashToken(token))
+	row := s.db.QueryRowContext(ctx, query, hashToken(token))
 	device, err := scanDevice(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Device{}, ErrUnauthorized
@@ -293,16 +287,13 @@ func scanDevice(row scanner) (Device, error) {
 	var device Device
 	var expires sql.NullString
 	var lastSeen string
-	err := row.Scan(&device.ID, &device.Name, &device.OS, &device.Arch, &device.Shell, &expires, &lastSeen)
-	if err != nil {
+	if err := row.Scan(&device.ID, &device.Name, &device.OS, &device.Arch, &device.Shell, &expires, &lastSeen); err != nil {
 		return Device{}, err
 	}
-	if expires.Valid {
-		parsed, parseErr := time.Parse(time.RFC3339Nano, expires.String)
-		if parseErr != nil {
-			return Device{}, fmt.Errorf("parse device expiry: %w", parseErr)
-		}
-		device.ExpiresAt = &parsed
+	var err error
+	device.ExpiresAt, err = parseOptionalTime(expires)
+	if err != nil {
+		return Device{}, fmt.Errorf("parse device expiry: %w", err)
 	}
 	device.LastSeen, err = time.Parse(time.RFC3339Nano, lastSeen)
 	if err != nil {
@@ -334,8 +325,9 @@ FROM devices ORDER BY name`
 }
 
 func (s *Store) Touch(ctx context.Context, id int64) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, "UPDATE devices SET last_seen = ? WHERE id = ?", now, id)
+	now := time.Now().UTC().Format(timeFormat)
+	const query = "UPDATE devices SET last_seen = ? WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)"
+	result, err := s.db.ExecContext(ctx, query, now, id, now)
 	if err != nil {
 		return fmt.Errorf("touch device: %w", err)
 	}
@@ -343,11 +335,7 @@ func (s *Store) Touch(ctx context.Context, id int64) error {
 }
 
 func (s *Store) SetExpiry(ctx context.Context, name string, expiry *time.Time) error {
-	var value any
-	if expiry != nil {
-		value = expiry.UTC().Format(time.RFC3339Nano)
-	}
-	result, err := s.db.ExecContext(ctx, "UPDATE devices SET expires_at = ? WHERE name = ?", value, name)
+	result, err := s.db.ExecContext(ctx, "UPDATE devices SET expires_at = ? WHERE name = ?", formatOptionalTime(expiry), name)
 	if err != nil {
 		return fmt.Errorf("set device expiry: %w", err)
 	}
@@ -356,14 +344,11 @@ func (s *Store) SetExpiry(ctx context.Context, name string, expiry *time.Time) e
 
 func (s *Store) Delete(ctx context.Context, name string) (int64, error) {
 	var id int64
-	err := s.db.QueryRowContext(ctx, "SELECT id FROM devices WHERE name = ?", name).Scan(&id)
+	err := s.db.QueryRowContext(ctx, "DELETE FROM devices WHERE name = ? RETURNING id", name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNotFound
 	}
 	if err != nil {
-		return 0, fmt.Errorf("find device: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM devices WHERE id = ?", id); err != nil {
 		return 0, fmt.Errorf("delete device: %w", err)
 	}
 	return id, nil
@@ -378,25 +363,4 @@ func requireOneRow(result sql.Result) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-func (s *Store) ExpiredIDs(ctx context.Context) ([]int64, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	rows, err := s.db.QueryContext(ctx, "SELECT id FROM devices WHERE expires_at IS NOT NULL AND expires_at <= ?", now)
-	if err != nil {
-		return nil, fmt.Errorf("list expired devices: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	ids := make([]int64, 0)
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan expired device: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate expired devices: %w", err)
-	}
-	return ids, nil
 }

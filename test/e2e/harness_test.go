@@ -3,9 +3,12 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,10 +21,12 @@ import (
 )
 
 const (
-	binaryEnv       = "DL_E2E_BINARY"
-	commandTimeout  = 15 * time.Second
-	readinessTimout = 10 * time.Second
-	statusTimeout   = 6 * time.Second
+	binaryEnv         = "DL_E2E_BINARY"
+	tempRootEnv       = "DL_E2E_TMPROOT"
+	commandTimeout    = 15 * time.Second
+	readinessTimout   = 10 * time.Second
+	statusTimeout     = 6 * time.Second
+	gracefulStopLimit = 1500 * time.Millisecond
 )
 
 type lockedBuffer struct {
@@ -44,6 +49,7 @@ func (b *lockedBuffer) String() string {
 type childProcess struct {
 	cmd      *exec.Cmd
 	logs     *lockedBuffer
+	stdout   *lockedBuffer
 	done     chan struct{}
 	stopOnce sync.Once
 	mu       sync.Mutex
@@ -80,6 +86,15 @@ func buildAndRunTests(m *testing.M, tempDir, binary string) int {
 		return 1
 	}
 	if err := os.Setenv(binaryEnv, binary); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	procTmpRoot := filepath.Join(tempDir, "tmp")
+	if err := os.MkdirAll(procTmpRoot, 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := os.Setenv(tempRootEnv, procTmpRoot); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -148,17 +163,23 @@ func freeAddress(t *testing.T) string {
 
 func startProcess(t *testing.T, binary string, args ...string) *childProcess {
 	t.Helper()
+	env := processEnvironment(t)
+	if hubStateDir := hubStateDirArg(args); hubStateDir != "" {
+		t.Cleanup(func() { assertHubStateDirClean(t, hubStateDir) })
+	}
 	cmd := exec.Command(binary, args...)
 	logs := &lockedBuffer{}
-	cmd.Stdout = logs
+	stdout := &lockedBuffer{}
+	cmd.Stdout = io.MultiWriter(stdout, logs)
 	cmd.Stderr = logs
-	cmd.Env = cleanEnvironment()
+	cmd.Env = env
 	prepareProcess(cmd)
-	p := &childProcess{cmd: cmd, logs: logs, done: make(chan struct{})}
+	p := &childProcess{cmd: cmd, logs: logs, stdout: stdout, done: make(chan struct{})}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s %v: %v", binary, args, err)
 	}
 	go p.wait()
+	t.Cleanup(func() { assertProcessStopped(t, p) })
 	t.Cleanup(p.stop)
 	return p
 }
@@ -166,12 +187,114 @@ func startProcess(t *testing.T, binary string, args ...string) *childProcess {
 func cleanEnvironment() []string {
 	env := make([]string, 0, len(os.Environ()))
 	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "DL_TOKEN=") {
+		if isScrubbedEnv(entry) {
 			continue
 		}
 		env = append(env, entry)
 	}
 	return env
+}
+
+func isScrubbedEnv(entry string) bool {
+	key, _, _ := strings.Cut(entry, "=")
+	return strings.EqualFold(key, "DL_TOKEN") ||
+		strings.EqualFold(key, "TMPDIR") ||
+		strings.EqualFold(key, "TMP") ||
+		strings.EqualFold(key, "TEMP")
+}
+
+func processEnvironment(t *testing.T) []string {
+	t.Helper()
+	tmpDir := processTempDir(t)
+	env := cleanEnvironment()
+	return append(env, "TMPDIR="+tmpDir, "TMP="+tmpDir, "TEMP="+tmpDir)
+}
+
+func processTempDir(t *testing.T) string {
+	t.Helper()
+	root := os.Getenv(tempRootEnv)
+	if root == "" {
+		t.Fatalf("%s is not set", tempRootEnv)
+	}
+	sum := sha256.Sum256([]byte(t.Name()))
+	dir := filepath.Join(root, fmt.Sprintf("%x", sum[:8]))
+	err := os.Mkdir(dir, 0o700)
+	if err == nil {
+		t.Cleanup(func() {
+			assertEmptyTempDir(t, dir)
+			_ = os.RemoveAll(dir)
+		})
+		return dir
+	}
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("create process temp dir %s: %v", dir, err)
+	}
+	return dir
+}
+
+func assertEmptyTempDir(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Errorf("read process temp dir %s: %v", dir, err)
+		return
+	}
+	for _, entry := range entries {
+		t.Errorf("leaked temp entry in %s: %s", dir, entry.Name())
+	}
+}
+
+func hubStateDirArg(args []string) string {
+	if len(args) == 0 || args[0] != "hub" {
+		return ""
+	}
+	for i := 1; i < len(args); i++ {
+		if after, ok := strings.CutPrefix(args[i], "--state-dir="); ok {
+			return after
+		}
+		if args[i] == "--state-dir" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func assertHubStateDirClean(t *testing.T, stateDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(stateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Errorf("read hub state dir %s: %v", stateDir, err)
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isAllowedHubStateFile(entry.Name()) {
+			t.Errorf("unexpected entry in hub state dir %s: %s", stateDir, entry.Name())
+		}
+	}
+}
+
+func isAllowedHubStateFile(name string) bool {
+	switch name {
+	case "cert.pem", "key.pem", "controller_token",
+		"hub.db", "hub.db-wal", "hub.db-shm", "hub.db-journal":
+		return true
+	default:
+		return false
+	}
+}
+
+func assertProcessStopped(t *testing.T, p *childProcess) {
+	t.Helper()
+	if !p.exited() {
+		t.Errorf("child process did not exit\n%s", p.output())
+		return
+	}
+	if err := waitProcessGroupDead(p.cmd, 500*time.Millisecond); err != nil {
+		t.Errorf("leaked process group: %v", err)
+	}
 }
 
 func (p *childProcess) wait() {
@@ -183,15 +306,34 @@ func (p *childProcess) wait() {
 }
 
 func (p *childProcess) stop() {
-	p.stopOnce.Do(func() {
-		_ = killProcessTree(p.cmd)
-		select {
-		case <-p.done:
-		case <-time.After(5 * time.Second):
-			_ = p.cmd.Process.Kill()
-			<-p.done
-		}
-	})
+	p.stopOnce.Do(p.stopProcess)
+}
+
+func (p *childProcess) stopProcess() {
+	if p.exited() {
+		return
+	}
+	_ = terminateProcessTree(p.cmd)
+	if p.waitDone(gracefulStopLimit) {
+		return
+	}
+	_ = killProcessTree(p.cmd)
+	if p.waitDone(5 * time.Second) {
+		return
+	}
+	_ = p.cmd.Process.Kill()
+	<-p.done
+}
+
+func (p *childProcess) waitDone(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (p *childProcess) exited() bool {
@@ -205,6 +347,10 @@ func (p *childProcess) exited() bool {
 
 func (p *childProcess) output() string {
 	return p.logs.String()
+}
+
+func (p *childProcess) stdoutOutput() string {
+	return p.stdout.String()
 }
 
 func (p *childProcess) exitError() error {
@@ -253,7 +399,7 @@ func runCLI(t *testing.T, binary string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Env = cleanEnvironment()
+	cmd.Env = processEnvironment(t)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return string(output), fmt.Errorf("command timed out: %w", ctx.Err())

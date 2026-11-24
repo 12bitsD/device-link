@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -30,8 +31,9 @@ type Device struct {
 }
 
 func New(baseURL, token, caPath string) (*Client, error) {
-	if baseURL == "" {
-		return nil, fmt.Errorf("hub URL is required")
+	normalized, err := NormalizeHubURL(baseURL)
+	if err != nil {
+		return nil, err
 	}
 	if token == "" {
 		return nil, fmt.Errorf("controller token is required (use --token or DL_TOKEN)")
@@ -41,19 +43,36 @@ func New(baseURL, token, caPath string) (*Client, error) {
 		return nil, err
 	}
 	httpClient.Timeout = 15 * time.Second
-	return &Client{baseURL: baseURL, token: token, http: httpClient}, nil
+	return &Client{baseURL: normalized, token: token, http: httpClient}, nil
+}
+
+func NormalizeHubURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("hub URL is required")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid hub HTTPS URL %q", raw)
+	}
+	return trimmed, nil
 }
 
 func HTTPClient(caPath string) (*http.Client, error) {
-	contents, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("read hub CA: %w", err)
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caPath != "" {
+		contents, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read hub CA: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(contents) {
+			return nil, fmt.Errorf("parse hub CA")
+		}
+		tlsConfig.RootCAs = roots
 	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(contents) {
-		return nil, fmt.Errorf("parse hub CA")
-	}
-	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: transport}, nil
 }
 
@@ -66,11 +85,10 @@ func ttlSeconds(ttl *time.Duration) *int64 {
 }
 
 func (c *Client) Invite(ctx context.Context, name string, ttl *time.Duration) (string, error) {
-	seconds := ttlSeconds(ttl)
 	request := struct {
 		Name       string `json:"name"`
 		TTLSeconds *int64 `json:"ttl_seconds"`
-	}{Name: name, TTLSeconds: seconds}
+	}{Name: name, TTLSeconds: ttlSeconds(ttl)}
 	response, err := c.request(ctx, http.MethodPost, "/v1/invites", request)
 	if err != nil {
 		return "", err

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -55,13 +56,14 @@ func runHub(ctx context.Context, args []string) error {
 	addr := flags.String("addr", ":8443", "HTTPS listen address")
 	host := flags.String("host", "", "advertised host/IP added to the self-signed TLS certificate")
 	stateDir := flags.String("state-dir", defaultStateDir("hub"), "hub state directory")
-	if err := flags.Parse(args); err != nil {
+	if err := parseNoArgs(flags, args); err != nil {
 		return err
 	}
 	return hub.Run(ctx, hub.Config{Addr: *addr, Host: *host, StateDir: *stateDir})
 }
 
 type controllerConfig struct {
+	flags    *flag.FlagSet
 	hubURL   string
 	token    string
 	caPath   string
@@ -69,9 +71,9 @@ type controllerConfig struct {
 }
 
 func addControllerFlags(flags *flag.FlagSet) *controllerConfig {
-	config := &controllerConfig{}
+	config := &controllerConfig{flags: flags}
 	flags.StringVar(&config.hubURL, "hub", "", "hub HTTPS URL")
-	flags.StringVar(&config.token, "token", os.Getenv("DL_TOKEN"), "controller token")
+	flags.StringVar(&config.token, "token", "", "controller token (defaults to DL_TOKEN or <state-dir>/controller_token)")
 	flags.StringVar(&config.caPath, "ca", "", "hub CA certificate")
 	flags.StringVar(&config.stateDir, "state-dir", defaultStateDir("hub"), "hub state directory for token/CA defaults")
 	return config
@@ -85,17 +87,46 @@ func (c *controllerConfig) connect() (*client.Client, error) {
 }
 
 func (c *controllerConfig) resolve() error {
-	if c.caPath == "" {
-		c.caPath = filepath.Join(c.stateDir, "cert.pem")
+	explicit := visitedFlags(c.flags)
+	if !explicit["ca"] {
+		defaultCA := filepath.Join(c.stateDir, "cert.pem")
+		if _, err := os.Stat(defaultCA); err == nil {
+			c.caPath = defaultCA
+		}
 	}
-	if c.token != "" {
+	if explicit["token"] {
+		return nil
+	}
+	if envToken := os.Getenv("DL_TOKEN"); envToken != "" {
+		c.token = envToken
 		return nil
 	}
 	data, err := os.ReadFile(filepath.Join(c.stateDir, "controller_token"))
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("controller token required (use --token, DL_TOKEN, or --state-dir): %w", err)
+	}
 	if err != nil {
-		return fmt.Errorf("controller token required (use --token, DL_TOKEN, or --state-dir)")
+		return fmt.Errorf("read controller token: %w", err)
 	}
 	c.token = strings.TrimSpace(string(data))
+	return nil
+}
+
+func visitedFlags(flags *flag.FlagSet) map[string]bool {
+	set := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) {
+		set[f.Name] = true
+	})
+	return set
+}
+
+func parseNoArgs(flags *flag.FlagSet, args []string) error {
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", flags.Args())
+	}
 	return nil
 }
 
@@ -104,7 +135,7 @@ func runInvite(ctx context.Context, args []string) error {
 	config := addControllerFlags(flags)
 	name := flags.String("name", "", "requested device name")
 	ttlText := flags.String("ttl", "", "initial device TTL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseNoArgs(flags, args); err != nil {
 		return err
 	}
 	if *name == "" {
@@ -122,7 +153,12 @@ func runInvite(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("dl join --hub %s --code %s --ca %s\n", quoteArg(config.hubURL), quoteArg(code), quoteArg(config.caPath))
+	hubURL, _ := client.NormalizeHubURL(config.hubURL)
+	if config.caPath != "" {
+		fmt.Printf("dl join --hub %s --code %s --ca %s\n", quoteArg(hubURL), quoteArg(code), quoteArg(config.caPath))
+		return nil
+	}
+	fmt.Printf("dl join --hub %s --code %s\n", quoteArg(hubURL), quoteArg(code))
 	return nil
 }
 
@@ -144,7 +180,7 @@ func runJoin(ctx context.Context, args []string) error {
 	code := flags.String("code", "", "one-time invite code")
 	caPath := flags.String("ca", "", "hub CA certificate")
 	stateDir := flags.String("state-dir", defaultStateDir("node"), "node state directory")
-	if err := flags.Parse(args); err != nil {
+	if err := parseNoArgs(flags, args); err != nil {
 		return err
 	}
 	config := node.Config{HubURL: *hubURL, Code: *code, CAPath: *caPath, StateDir: *stateDir}
@@ -155,7 +191,7 @@ func runList(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("ls", flag.ContinueOnError)
 	config := addControllerFlags(flags)
 	jsonOutput := flags.Bool("json", false, "print JSON")
-	if err := flags.Parse(args); err != nil {
+	if err := parseNoArgs(flags, args); err != nil {
 		return err
 	}
 	controller, err := config.connect()
@@ -170,13 +206,13 @@ func runList(ctx context.Context, args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(devices)
 	}
 	writer := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "NAME\tSTATUS\tOS/ARCH\tEXPIRES\tLAST SEEN")
+	fmt.Fprintln(writer, "NAME\tSTATUS\tOS/ARCH\tSHELL\tEXPIRES\tLAST SEEN")
 	for _, device := range devices {
 		expires := "never"
 		if device.ExpiresAt != nil {
 			expires = *device.ExpiresAt
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s/%s\t%s\t%s\n", device.Name, device.Status, device.OS, device.Arch, expires, device.LastSeen)
+		fmt.Fprintf(writer, "%s\t%s\t%s/%s\t%s\t%s\t%s\n", device.Name, device.Status, device.OS, device.Arch, device.Shell, expires, device.LastSeen)
 	}
 	return writer.Flush()
 }

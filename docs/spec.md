@@ -12,14 +12,16 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 
 - `dl hub --addr :8443 [--host <advertised-host-or-ip>] --state-dir <dir>` initializes the Hub state (pure-Go SQLite, single file) and prints/stores the initial controller token and bound `DL_ADDR`. The self-signed certificate always covers `localhost`/`127.0.0.1`/`::1`; `--host` adds a LAN/public DNS name or IP to its SANs.
 - `dl invite --name <name> [--ttl 24h]` (controller) generates a one-time short-lived invite code and prints a single paste-ready command:
-  `dl join --hub <url> --code <code> [--service]`
+  `dl join --hub <url> --code <code> [--ca <path>]` (nodes may also pass `--service` in Stage 4)
 - `dl join` exchanges the one-time invite code for a persistent `device_token` stored in the node's `--state-dir`, then opens one persistent WebSocket control connection to the Hub.
-- Immediately upon establishing (or re-establishing) the WebSocket session, `dl join` prints a single status line to stdout reporting the assigned `name`, `status=alive`, `os/arch`, `shell`, and `expires_at` (`never` or RFC3339 timestamp), and resets its reconnect backoff to the initial interval (`250ms`). The WebSocket loop decouples reading incoming Hub frames from periodic heartbeat pings so Hub-pushed commands are received without delay.
+- Immediately upon establishing (or re-establishing) the WebSocket session, `dl join` prints a single status line to stdout:
+  `dl connected: name=<name> status=alive platform=<os>/<arch> shell=<shell> expires_at=<never|RFC3339>`
+  and resets its reconnect backoff to the initial interval (`250ms`) once the session is healthy. The WebSocket loop decouples reading incoming Hub frames from periodic heartbeat pings so Hub-pushed frames and `Close` frames are processed immediately without waiting for the next 1s ping tick.
 - Each device record has `expires_at` (`null` by default = never expires). Controller can change it via `dl ttl <name> <duration|never>` or revoke & kick via `dl rm <name>`.
 - Hub maintains a single namespace mapping `name -> live connection`:
   - Name collision from a *different* device auto-appends an incrementing suffix: `mac` -> `mac-2` -> `mac-3`.
   - Same device reconnecting (network flap / hotspot switch) with its `device_token` reclaims its original assigned name.
-- `dl ls [--json]` returns minimal metadata only: `name`, `status` (`alive` | `missed`), `os`, `arch`, `shell`, `expires_at`, `last_seen`. Everything else (disk, cwd, hardware) is queried on demand via `exec`.
+- `dl ls [--json]` returns minimal metadata only: `name`, `status` (`alive` | `missed`), `os`, `arch`, `shell`, `expires_at`, `last_seen` (human table columns: `NAME`, `STATUS`, `OS/ARCH`, `SHELL`, `EXPIRES`, `LAST SEEN`). Everything else (disk, cwd, hardware) is queried on demand via `exec`.
 - Heartbeats detect dead connections (e.g. ~3s missed heartbeat marks `missed` while keeping the registry entry and `last_seen`). Nodes auto-reconnect with backoff.
 
 ## 3. Remote Shell (`Exec` only, Stage 2)

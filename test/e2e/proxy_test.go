@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 type tcpProxy struct {
@@ -13,6 +14,7 @@ type tcpProxy struct {
 	mu       sync.Mutex
 	listener net.Listener
 	online   bool
+	gen      uint64
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
 }
@@ -44,10 +46,12 @@ func (p *tcpProxy) Resume() error {
 	if err != nil {
 		return err
 	}
+	p.gen++
+	gen := p.gen
 	p.listener = listener
 	p.online = true
 	p.wg.Add(1)
-	go p.acceptLoop(listener)
+	go p.acceptLoop(listener, gen)
 	return nil
 }
 
@@ -57,6 +61,7 @@ func (p *tcpProxy) Drop() error {
 		p.mu.Unlock()
 		return nil
 	}
+	p.gen++
 	p.online = false
 	listener := p.listener
 	connections := make([]net.Conn, 0, len(p.conns))
@@ -74,7 +79,7 @@ func (p *tcpProxy) Drop() error {
 	return err
 }
 
-func (p *tcpProxy) acceptLoop(listener net.Listener) {
+func (p *tcpProxy) acceptLoop(listener net.Listener, gen uint64) {
 	defer p.wg.Done()
 	for {
 		conn, err := listener.Accept()
@@ -82,47 +87,47 @@ func (p *tcpProxy) acceptLoop(listener net.Listener) {
 			return
 		}
 		p.wg.Add(1)
-		go p.handle(conn)
+		go p.handle(conn, gen)
 	}
 }
 
-func (p *tcpProxy) handle(client net.Conn) {
+func (p *tcpProxy) handle(clientConn net.Conn, gen uint64) {
 	defer p.wg.Done()
-	upstream, err := net.Dial("tcp", p.target)
+	upstream, err := net.DialTimeout("tcp", p.target, 2*time.Second)
 	if err != nil {
-		_ = client.Close()
+		_ = clientConn.Close()
 		return
 	}
-	if !p.registerPair(client, upstream) {
-		_ = client.Close()
+	if !p.registerPair(clientConn, upstream, gen) {
+		_ = clientConn.Close()
 		_ = upstream.Close()
 		return
 	}
-	defer p.unregisterPair(client, upstream)
+	defer p.unregisterPair(clientConn, upstream)
 	copyDone := make(chan struct{}, 2)
-	go proxyCopy(client, upstream, copyDone)
-	go proxyCopy(upstream, client, copyDone)
+	go proxyCopy(clientConn, upstream, copyDone)
+	go proxyCopy(upstream, clientConn, copyDone)
 	<-copyDone
-	_ = client.Close()
+	_ = clientConn.Close()
 	_ = upstream.Close()
 	<-copyDone
 }
 
-func (p *tcpProxy) registerPair(client, upstream net.Conn) bool {
+func (p *tcpProxy) registerPair(clientConn, upstream net.Conn, gen uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.online {
+	if !p.online || p.gen != gen {
 		return false
 	}
-	p.conns[client] = struct{}{}
+	p.conns[clientConn] = struct{}{}
 	p.conns[upstream] = struct{}{}
 	return true
 }
 
-func (p *tcpProxy) unregisterPair(client, upstream net.Conn) {
+func (p *tcpProxy) unregisterPair(clientConn, upstream net.Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.conns, client)
+	delete(p.conns, clientConn)
 	delete(p.conns, upstream)
 }
 

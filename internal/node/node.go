@@ -10,10 +10,17 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/12bitsD/device-link/internal/client"
 	"github.com/coder/websocket"
+)
+
+const (
+	initialBackoff = 250 * time.Millisecond
+	maxBackoff     = 2 * time.Second
+	frameTimeout   = 3 * time.Second
 )
 
 var errUnauthorized = errors.New("hub authentication rejected")
@@ -29,7 +36,21 @@ type state struct {
 	DeviceToken string `json:"device_token"`
 }
 
+type hubFrame struct {
+	Type      string `json:"type"`
+	Name      string `json:"name,omitempty"`
+	OS        string `json:"os,omitempty"`
+	Arch      string `json:"arch,omitempty"`
+	Shell     string `json:"shell,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
 func Run(ctx context.Context, config Config) error {
+	hubURL, err := client.NormalizeHubURL(config.HubURL)
+	if err != nil {
+		return err
+	}
+	config.HubURL = hubURL
 	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
 		return fmt.Errorf("create node state: %w", err)
 	}
@@ -37,11 +58,13 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	credentials, err := credentials(ctx, config, httpClient)
+	defer httpClient.CloseIdleConnections()
+	creds, err := credentials(ctx, config, httpClient)
 	if err != nil {
 		return err
 	}
-	return maintainConnection(ctx, config.HubURL, credentials.DeviceToken, httpClient)
+	httpClient.CloseIdleConnections()
+	return maintainConnection(ctx, config.HubURL, creds.DeviceToken, httpClient)
 }
 
 func credentials(ctx context.Context, config Config, httpClient *http.Client) (state, error) {
@@ -79,16 +102,12 @@ func readState(path string) (state, error) {
 }
 
 func writeState(path string, saved state) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	encoded, err := json.Marshal(saved)
 	if err != nil {
-		return fmt.Errorf("write node state: %w", err)
-	}
-	if err := json.NewEncoder(file).Encode(saved); err != nil {
-		_ = file.Close()
 		return fmt.Errorf("encode node state: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close node state: %w", err)
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write node state: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("secure node state: %w", err)
@@ -97,8 +116,10 @@ func writeState(path string, saved state) error {
 }
 
 func exchangeInvite(ctx context.Context, config Config, httpClient *http.Client) (state, error) {
+	joinCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	request := joinRequest{Code: config.Code, OS: runtime.GOOS, Arch: runtime.GOARCH, Shell: shell()}
-	response, err := postJSON(ctx, httpClient, config.HubURL+"/v1/join", request)
+	response, err := postJSON(joinCtx, httpClient, config.HubURL+"/v1/join", request)
 	if err != nil {
 		return state{}, err
 	}
@@ -122,47 +143,49 @@ type joinRequest struct {
 
 func shell() string {
 	if runtime.GOOS == "windows" {
-		if shell := os.Getenv("COMSPEC"); shell != "" {
-			return shell
+		if value := os.Getenv("COMSPEC"); value != "" {
+			return value
 		}
 		return "powershell.exe"
 	}
-	if shell := os.Getenv("SHELL"); shell != "" {
-		return shell
+	if value := os.Getenv("SHELL"); value != "" {
+		return value
 	}
 	return "/bin/sh"
 }
 
-func maintainConnection(ctx context.Context, hubURL, token string, client *http.Client) error {
-	backoff := 250 * time.Millisecond
+func maintainConnection(ctx context.Context, hubURL, token string, httpClient *http.Client) error {
+	backoff := initialBackoff
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := connect(ctx, hubURL, token, client)
+		healthy, err := connect(ctx, hubURL, token, httpClient)
 		if ctx.Err() != nil {
 			return nil
 		}
 		if errors.Is(err, errUnauthorized) {
 			return err
 		}
+		if healthy {
+			backoff = initialBackoff
+		}
 		if !sleep(ctx, backoff) {
 			return nil
 		}
-		backoff = min(backoff*2, 2*time.Second)
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
-func connect(ctx context.Context, hubURL, token string, client *http.Client) error {
-	dialCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+func connect(ctx context.Context, hubURL, token string, httpClient *http.Client) (bool, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, frameTimeout)
 	header := http.Header{"Authorization": []string{"Bearer " + token}}
-	conn, response, err := websocket.Dial(dialCtx, hubURL+"/v1/node", &websocket.DialOptions{HTTPClient: client, HTTPHeader: header})
+	conn, response, err := websocket.Dial(dialCtx, hubURL+"/v1/node", &websocket.DialOptions{HTTPClient: httpClient, HTTPHeader: header})
 	cancel()
 	if err != nil {
-		return dialError(response, err)
+		return false, dialError(response, err)
 	}
-	defer func() { _ = conn.CloseNow() }()
-	return heartbeatLoop(ctx, conn)
+	return runSession(ctx, conn)
 }
 
 func dialError(response *http.Response, err error) error {
@@ -175,21 +198,72 @@ func dialError(response *http.Response, err error) error {
 	return fmt.Errorf("connect to hub: %w", err)
 }
 
-func heartbeatLoop(ctx context.Context, conn *websocket.Conn) error {
-	conn.SetReadLimit(64)
+func runSession(ctx context.Context, conn *websocket.Conn) (bool, error) {
+	conn.SetReadLimit(4096)
+	var healthy atomic.Bool
+	readDone := make(chan error, 1)
+	go func() {
+		defer close(readDone)
+		readDone <- readFrames(ctx, conn, &healthy)
+	}()
+	defer func() {
+		_ = conn.CloseNow()
+		<-readDone
+	}()
+	err := writeHeartbeats(ctx, conn, readDone)
+	return healthy.Load(), err
+}
+
+func writeHeartbeats(ctx context.Context, conn *websocket.Conn, readDone <-chan error) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
-		if !sleep(ctx, time.Second) {
+		select {
+		case <-ctx.Done():
 			return nil
+		case err := <-readDone:
+			return err
+		case <-ticker.C:
 		}
-		if err := conn.Write(ctx, websocket.MessageText, []byte("ping")); err != nil {
+		if err := writeFrame(ctx, conn, hubFrame{Type: "ping"}); err != nil {
 			return fmt.Errorf("write hub heartbeat: %w", err)
 		}
-		readCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		_, _, err := conn.Read(readCtx)
+	}
+}
+
+func writeFrame(ctx context.Context, conn *websocket.Conn, frame hubFrame) error {
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("encode node frame: %w", err)
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, frameTimeout)
+	defer cancel()
+	return conn.Write(writeCtx, websocket.MessageText, payload)
+}
+
+func readFrames(ctx context.Context, conn *websocket.Conn, healthy *atomic.Bool) error {
+	for {
+		readCtx, cancel := context.WithTimeout(ctx, frameTimeout)
+		_, data, err := conn.Read(readCtx)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("read hub heartbeat: %w", err)
+			return fmt.Errorf("read hub frame: %w", err)
 		}
+		handleFrame(data, healthy)
+	}
+}
+
+func handleFrame(data []byte, healthy *atomic.Bool) {
+	var frame hubFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return
+	}
+	switch frame.Type {
+	case "connected":
+		fmt.Printf("dl connected: name=%s status=alive platform=%s/%s shell=%s expires_at=%s\n",
+			frame.Name, frame.OS, frame.Arch, frame.Shell, frame.ExpiresAt)
+	case "pong":
+		healthy.Store(true)
 	}
 }
 
@@ -204,17 +278,17 @@ func sleep(ctx context.Context, duration time.Duration) bool {
 	}
 }
 
-func postJSON(ctx context.Context, client *http.Client, url string, value any) (*http.Response, error) {
+func postJSON(ctx context.Context, httpClient *http.Client, targetURL string, value any) (*http.Response, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}

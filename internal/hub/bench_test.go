@@ -19,7 +19,7 @@ func BenchmarkHandleDevicesList(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = store.Close() })
-	token, err := store.ControllerToken(ctx)
+	token, err := store.MintControllerToken(ctx)
 	if err != nil {
 		b.Fatal(err)
 	}

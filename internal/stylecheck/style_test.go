@@ -334,7 +334,7 @@ func (v *visitor) checkSignature(ft *ast.FuncType, pos token.Pos) {
 	}
 	count := 0
 	for i, field := range ft.Params.List {
-		count += maxInt(len(field.Names), 1)
+		count += max(len(field.Names), 1)
 		v.checkParamKind(field, pos, i)
 	}
 	if count > maxParams && !v.allowed(pos, "BCS004") {
@@ -376,7 +376,7 @@ type flowMetrics struct {
 }
 
 func (m *flowMetrics) merge(d, c int) {
-	m.maxDepth = maxInt(m.maxDepth, d)
+	m.maxDepth = max(m.maxDepth, d)
 	m.complexity += c
 }
 
@@ -441,8 +441,4 @@ func walkList(stmts []ast.Stmt, depth, complexity int) (int, int) {
 		m.merge(walkControl(s, depth, 0))
 	}
 	return m.maxDepth, m.complexity
-}
-
-func maxInt(a, b int) int {
-	return int(max(a, b))
 }

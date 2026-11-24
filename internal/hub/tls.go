@@ -19,6 +19,9 @@ func ensureCertificate(stateDir, host string) error {
 	certPath := filepath.Join(stateDir, "cert.pem")
 	keyPath := filepath.Join(stateDir, "key.pem")
 	if fileExists(certPath) && fileExists(keyPath) {
+		if err := os.Chmod(keyPath, 0o600); err != nil {
+			return fmt.Errorf("secure TLS key: %w", err)
+		}
 		return nil
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -72,16 +75,12 @@ func fileExists(path string) bool {
 }
 
 func writePEM(path, kind string, der []byte, mode os.FileMode) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
-	}
-	if err := pem.Encode(file, &pem.Block{Type: kind, Bytes: der}); err != nil {
-		_ = file.Close()
+	encoded := pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der})
+	if err := os.WriteFile(path, encoded, mode); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", path, err)
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
 	}
 	return nil
 }

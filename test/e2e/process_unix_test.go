@@ -14,21 +14,18 @@ func prepareProcess(cmd *exec.Cmd) {
 }
 
 func killProcessTree(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
-		return nil
-	}
-	return err
+	return signalProcessTree(cmd, syscall.SIGKILL)
 }
 
 func terminateProcessTree(cmd *exec.Cmd) error {
+	return signalProcessTree(cmd, syscall.SIGTERM)
+}
+
+func signalProcessTree(cmd *exec.Cmd, sig syscall.Signal) error {
 	if cmd.Process == nil {
 		return nil
 	}
-	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	err := syscall.Kill(-cmd.Process.Pid, sig)
 	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
 		return nil
 	}

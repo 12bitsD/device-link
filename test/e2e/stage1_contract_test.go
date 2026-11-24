@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"database/sql"
 	"encoding/pem"
 	"fmt"
@@ -156,7 +157,12 @@ func TestStage1InviteQuotesPathsWithSpaces(t *testing.T) {
 	output := mustController(t, h, "invite", "--name", "spaced", "--ca", spaceCA)
 	nodeDir := filepath.Join(t.TempDir(), "node dir")
 	script := fmt.Sprintf("export PATH=%q:$PATH; %s --state-dir %q & pid=$!; sleep 2; kill -TERM $pid; wait $pid", filepath.Dir(h.binary), strings.TrimSpace(output), nodeDir)
-	cmd := exec.Command("sh", "-c", script)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+	cmd.Env = processEnvironment(t)
+	prepareProcess(cmd)
+	t.Cleanup(func() { _ = killProcessTree(cmd) })
 	if combined, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("quoted join failed: %v\n%s", err, combined)
 	}
@@ -176,11 +182,18 @@ func TestStage1NodeAnswersWebSocketClosePromptly(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// bits:allow(E2E_SLEEP): let the client enter its read loop before sending Close
-		time.Sleep(300 * time.Millisecond)
+		defer func() { _ = conn.CloseNow() }()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
 		start := time.Now()
 		_ = conn.Close(websocket.StatusGoingAway, "shutdown")
-		closed <- time.Since(start)
+		select {
+		case closed <- time.Since(start):
+		default:
+		}
 	})
 	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
