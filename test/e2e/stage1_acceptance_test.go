@@ -17,7 +17,6 @@ func TestStage1JoinRejectsRetiredFlags(t *testing.T) {
 		args []string
 	}{
 		{name: "name", args: []string{"join", "--name", "mac"}},
-		{name: "service", args: []string{"join", "--service"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

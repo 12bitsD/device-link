@@ -82,14 +82,11 @@ type nodeRunner struct {
 }
 
 type sessionConn struct {
-	conn       *websocket.Conn
-	writeMu    sync.Mutex
-	hubURL     string
-	token      string
-	httpClient *http.Client
-	jobs       *jobManager
-	healthy    atomic.Bool
-	rpcWG      sync.WaitGroup
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+	runner  *nodeRunner
+	healthy atomic.Bool
+	rpcWG   sync.WaitGroup
 }
 
 func (s *sessionConn) send(ctx context.Context, frame hubFrame) error {
@@ -104,38 +101,55 @@ func (s *sessionConn) send(ctx context.Context, frame hubFrame) error {
 	return s.conn.Write(writeCtx, websocket.MessageText, payload)
 }
 
-func Run(ctx context.Context, config Config) error {
-	hubURL, err := client.NormalizeHubURL(config.HubURL)
-	if err != nil {
-		return err
-	}
-	config.HubURL = hubURL
-	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
-		return fmt.Errorf("create node state: %w", err)
-	}
-	httpClient, err := client.HTTPClient(config.CAPath)
-	if err != nil {
-		return err
-	}
-	defer httpClient.CloseIdleConnections()
-	creds, err := credentials(ctx, config, httpClient)
+func Enroll(ctx context.Context, config Config) error {
+	_, _, httpClient, err := enroll(ctx, config)
 	if err != nil {
 		return err
 	}
 	httpClient.CloseIdleConnections()
+	return nil
+}
+
+func Run(ctx context.Context, config Config) error {
+	hubURL, token, httpClient, err := enroll(ctx, config)
+	if err != nil {
+		return err
+	}
+	defer httpClient.CloseIdleConnections()
 	jobs, err := newJobManager(ctx, config.StateDir, shell())
 	if err != nil {
 		return err
 	}
 	defer jobs.Close()
-	runner := &nodeRunner{hubURL: config.HubURL, token: creds.DeviceToken, httpClient: httpClient, jobs: jobs}
+	runner := &nodeRunner{hubURL: hubURL, token: token, httpClient: httpClient, jobs: jobs}
 	return runner.maintain(ctx)
 }
 
-func credentials(ctx context.Context, config Config, httpClient *http.Client) (state, error) {
+func enroll(ctx context.Context, config Config) (string, string, *http.Client, error) {
+	hubURL, err := client.NormalizeHubURL(config.HubURL)
+	if err != nil {
+		return "", "", nil, err
+	}
+	httpClient, err := client.HTTPClient(config.CAPath)
+	if err != nil {
+		return "", "", nil, err
+	}
+	creds, err := credentials(ctx, hubURL, config, httpClient)
+	if err != nil {
+		httpClient.CloseIdleConnections()
+		return "", "", nil, err
+	}
+	httpClient.CloseIdleConnections()
+	return hubURL, creds.DeviceToken, httpClient, nil
+}
+
+func credentials(ctx context.Context, hubURL string, config Config, httpClient *http.Client) (state, error) {
 	statePath := filepath.Join(config.StateDir, "node.json")
 	saved, err := readState(statePath)
 	if err == nil && saved.DeviceToken != "" {
+		if chmodErr := os.Chmod(statePath, 0o600); chmodErr != nil {
+			return state{}, fmt.Errorf("secure node state: %w", chmodErr)
+		}
 		return saved, nil
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -144,9 +158,12 @@ func credentials(ctx context.Context, config Config, httpClient *http.Client) (s
 	if config.Code == "" {
 		return state{}, fmt.Errorf("invite code required for first join")
 	}
-	saved, err = exchangeInvite(ctx, config, httpClient)
+	saved, err = exchangeInvite(ctx, hubURL, config.Code, httpClient)
 	if err != nil {
 		return state{}, err
+	}
+	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
+		return state{}, fmt.Errorf("create node state: %w", err)
 	}
 	if err := writeState(statePath, saved); err != nil {
 		return state{}, err
@@ -171,20 +188,39 @@ func writeState(path string, saved state) error {
 	if err != nil {
 		return fmt.Errorf("encode node state: %w", err)
 	}
-	if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".node-state-*")
+	if err != nil {
+		return fmt.Errorf("stage node state: %w", err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(append(encoded, '\n')); err != nil {
 		return fmt.Errorf("write node state: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := tmp.Chmod(0o600); err != nil {
 		return fmt.Errorf("secure node state: %w", err)
 	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close node state: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("commit node state: %w", err)
+	}
+	committed = true
 	return nil
 }
 
-func exchangeInvite(ctx context.Context, config Config, httpClient *http.Client) (state, error) {
+func exchangeInvite(ctx context.Context, hubURL, code string, httpClient *http.Client) (state, error) {
 	joinCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	request := joinRequest{Code: config.Code, OS: runtime.GOOS, Arch: runtime.GOARCH, Shell: shell()}
-	response, err := postJSON(joinCtx, httpClient, config.HubURL+"/v1/join", request)
+	request := joinRequest{Code: code, OS: runtime.GOOS, Arch: runtime.GOARCH, Shell: shell()}
+	response, err := postJSON(joinCtx, httpClient, hubURL+"/v1/join", request)
 	if err != nil {
 		return state{}, err
 	}
@@ -250,13 +286,7 @@ func (r *nodeRunner) connectOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, dialError(response, err)
 	}
-	session := &sessionConn{
-		conn:       conn,
-		hubURL:     r.hubURL,
-		token:      r.token,
-		httpClient: r.httpClient,
-		jobs:       r.jobs,
-	}
+	session := &sessionConn{conn: conn, runner: r}
 	return session.run(ctx)
 }
 
@@ -273,7 +303,7 @@ func dialError(response *http.Response, err error) error {
 func (s *sessionConn) run(ctx context.Context) (bool, error) {
 	s.conn.SetReadLimit(maxFrameBytes)
 	sessionCtx, cancel := context.WithCancel(ctx)
-	s.jobs.setNotifier(func(frame hubFrame) {
+	s.runner.jobs.setNotifier(func(frame hubFrame) {
 		_ = s.send(sessionCtx, frame)
 	})
 	readDone := make(chan error, 1)
@@ -286,7 +316,7 @@ func (s *sessionConn) run(ctx context.Context) (bool, error) {
 	_ = s.conn.CloseNow()
 	<-readDone
 	s.rpcWG.Wait()
-	s.jobs.setNotifier(nil)
+	s.runner.jobs.setNotifier(nil)
 	return s.healthy.Load(), err
 }
 
@@ -356,22 +386,22 @@ func (s *sessionConn) executeRPC(frame hubFrame) hubFrame {
 	reply := hubFrame{Type: "rpc_reply", ReqID: frame.ReqID, JobID: frame.JobID}
 	switch frame.Type {
 	case "exec_start":
-		setRPCError(&reply, s.jobs.start(frame))
+		setRPCError(&reply, s.runner.jobs.start(frame))
 	case "job_status":
-		status, err := s.jobs.status(frame.JobID)
+		status, err := s.runner.jobs.status(frame.JobID)
 		if !setRPCError(&reply, err) {
 			reply.State = status.State
 			reply.ExitCode = status.ExitCode
 			reply.Bytes = status.Bytes
 		}
 	case "job_logs":
-		chunk, eof, err := s.jobs.readLogs(frame.JobID, frame.Offset)
+		chunk, eof, err := s.runner.jobs.readLogs(frame.JobID, frame.Offset)
 		if !setRPCError(&reply, err) {
 			reply.Chunk = chunk
 			reply.EOF = eof
 		}
 	case "job_kill":
-		setRPCError(&reply, s.jobs.kill(frame.JobID))
+		setRPCError(&reply, s.runner.jobs.kill(frame.JobID))
 	}
 	return reply
 }

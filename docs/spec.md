@@ -89,7 +89,19 @@ Device Link is an ultra-lightweight, single-tenant protocol and single-binary Go
 - **Stage 1**: Hub registry (SQLite) + one-time invite / device token auth + WebSocket long connection + heartbeat (`alive`/`missed`) + Namespace auto-numbering + `invite` / `join` / `ls` / `ttl` / `rm` + role isolation.
 - **Stage 2**: Remote `exec` (`--wait`, `--detach`, `--wait-online`) + offline continuation & log resume (`--offset`) + process-group kill.
 - **Stage 3**: `<= 500MB` pre-flight + SHA-256 skip + independent HTTP `tar` in-memory Hub relay + transfer status/cancel.
-- **Stage 4**: OS background services (`launchd` / `systemd` / Windows Service) + GitHub Actions 3-OS release pipeline.
+- **Stage 4**: OS background services (`launchd` / `systemd` / Windows Service), one-line install/join script, and GitHub Actions 3-OS CI & 6-target Release pipeline:
+  - **CLI Surface (`dl join --service`)**:
+    - `dl join [--service] --hub <url> [--code <code>] [--ca <path>] [--state-dir <dir>]`
+    - When `--service` is passed, `dl join` first resolves absolute paths for the `dl` executable, `--state-dir`, and `--ca` (when set), and ensures `<state-dir>/node.json` (`0600`) exists by exchanging `--code` up front if not yet enrolled (failing non-zero before touching OS service files if `--hub` is missing/invalid or `--code` is rejected).
+    - The registered service command runs `<abs-dl> join --hub <url> --state-dir <abs-state-dir> [--ca <abs-ca-path>]` without embedding the one-time `--code` secret, then prints `dl service installed: platform=<os> unit=<path-or-name>` to stdout and exits `0`:
+      - **macOS (`darwin`, `launchd`)**: writes plist `io.devicelink.node.plist` (`0644`, `RunAtLoad=true`, `KeepAlive=true`, logs in `<state-dir>/service.log`) to `/Library/LaunchDaemons/io.devicelink.node.plist` when `euid == 0` or `$HOME/Library/LaunchAgents/io.devicelink.node.plist` otherwise, and loads/starts it via `launchctl` (`bootout` ignore error, `bootstrap`, `kickstart -k`).
+      - **Linux (`linux`, `systemd`)**: writes unit `device-link.service` (`0644`, `Restart=always`, `RestartSec=2`) to `/etc/systemd/system/device-link.service` (`systemctl daemon-reload` + `systemctl enable --now device-link.service`) when `euid == 0`, or `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/device-link.service` (`systemctl --user daemon-reload` + `systemctl --user enable --now device-link.service`) otherwise.
+      - **Windows (`windows`, Windows Service)**: registers/updates service `DeviceLink` (`start= auto`) via `sc.exe` (`create` or `config`, then `start DeviceLink`), and when `dl join` starts under the Windows Service Control Manager (`svc.IsWindowsService()`), runs `node.Run` inside a `golang.org/x/sys/windows/svc` handler that cancels context cleanly on `Stop`/`Shutdown`.
+  - **One-Line Install & Join Script (`scripts/install.sh`)**:
+    - Detects `darwin`/`linux` and `amd64`/`arm64`, downloads `dl_<os>_<arch>.tar.gz` and `checksums.txt` from `${DL_BASE_URL}` (defaulting to GitHub Releases for `${DL_REPO:-12bitsD/device-link}` and `${DL_VERSION:-latest}`), verifies SHA-256 against `checksums.txt` (failing non-zero on mismatch), installs `dl` (`0755`) into `${DL_INSTALL_DIR}` (`/usr/local/bin` if writable, else `$HOME/.local/bin`), cleans temporary files on exit, and if trailing arguments are given (optional leading `--` stripped), execs `"$DL_INSTALL_DIR/dl" "$@"`.
+  - **GitHub Actions CI & Release (`.github/workflows/ci.yml`, `.github/workflows/release.yml`)**:
+    - `ci.yml` runs on `push` (`main`) and `pull_request`, executing static/style checks + 6-target cross-compile and running `go test -race` + `./test/e2e` across `ubuntu-latest`, `macos-latest`, and `windows-latest`.
+    - `release.yml` runs on `v*` tags (and `workflow_dispatch`), verifies tests, builds `CGO_ENABLED=0` static archives for all 6 targets (`darwin`/`linux` `.tar.gz` and `windows` `.zip` × `amd64`/`arm64`) plus `checksums.txt`, and publishes them to GitHub Releases.
 
 ## 7. Black-Box Verification Contract
 

@@ -18,6 +18,7 @@ import (
 	"github.com/12bitsD/device-link/internal/client"
 	"github.com/12bitsD/device-link/internal/hub"
 	"github.com/12bitsD/device-link/internal/node"
+	"github.com/12bitsD/device-link/internal/service"
 )
 
 func main() {
@@ -180,7 +181,27 @@ func quoteArg(value string) string {
 		return value
 	}
 	if runtime.GOOS == "windows" {
-		return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+		var b strings.Builder
+		b.WriteByte('"')
+		slashes := 0
+		for i := 0; i < len(value); i++ {
+			if value[i] == '\\' {
+				slashes++
+				continue
+			}
+			if value[i] == '"' {
+				b.WriteString(strings.Repeat(`\`, slashes*2+1))
+				b.WriteByte('"')
+				slashes = 0
+				continue
+			}
+			b.WriteString(strings.Repeat(`\`, slashes))
+			b.WriteByte(value[i])
+			slashes = 0
+		}
+		b.WriteString(strings.Repeat(`\`, slashes*2))
+		b.WriteByte('"')
+		return b.String()
 	}
 	return `'` + strings.ReplaceAll(value, `'`, `'"'"'`) + `'`
 }
@@ -191,11 +212,43 @@ func runJoin(ctx context.Context, args []string) error {
 	code := flags.String("code", "", "one-time invite code")
 	caPath := flags.String("ca", "", "hub CA certificate")
 	stateDir := flags.String("state-dir", defaultStateDir("node"), "node state directory")
+	asService := flags.Bool("service", false, "install and start OS background service")
 	if err := parseNoArgs(flags, args); err != nil {
 		return err
 	}
 	config := node.Config{HubURL: *hubURL, Code: *code, CAPath: *caPath, StateDir: *stateDir}
-	return node.Run(ctx, config)
+	if *asService {
+		return installJoinService(ctx, config)
+	}
+	return service.Run(ctx, func(runCtx context.Context) error {
+		return node.Run(runCtx, config)
+	})
+}
+
+func installJoinService(ctx context.Context, config node.Config) error {
+	normalizedURL, err := client.NormalizeHubURL(config.HubURL)
+	if err != nil {
+		return err
+	}
+	svcCfg, err := service.Resolve(normalizedURL, config.StateDir, config.CAPath)
+	if err != nil {
+		return err
+	}
+	enrollCfg := node.Config{
+		HubURL:   normalizedURL,
+		Code:     config.Code,
+		CAPath:   svcCfg.CAPath,
+		StateDir: svcCfg.StateDir,
+	}
+	if err := node.Enroll(ctx, enrollCfg); err != nil {
+		return err
+	}
+	unit, err := service.Install(ctx, svcCfg)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("dl service installed: platform=%s unit=%s\n", runtime.GOOS, unit)
+	return nil
 }
 
 func runList(ctx context.Context, args []string) error {

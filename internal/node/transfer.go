@@ -36,7 +36,7 @@ func (s *sessionConn) executeTransferRPC(ctx context.Context, frame hubFrame) (h
 			s.rpcWG.Add(1)
 			go func() {
 				defer s.rpcWG.Done()
-				s.streamDownloadFromHub(ctx, frame.TransferID, frame.StreamToken, frame.TargetDir)
+				s.runner.streamDownloadFromHub(ctx, frame.TransferID, frame.StreamToken, frame.TargetDir)
 			}()
 		}
 	default:
@@ -61,12 +61,12 @@ func (s *sessionConn) prepareSendLauncher(ctx context.Context, frame hubFrame, r
 		s.rpcWG.Add(1)
 		go func() {
 			defer s.rpcWG.Done()
-			s.streamUploadToHub(ctx, frame.TransferID, frame.StreamToken, plan)
+			s.runner.streamUploadToHub(ctx, frame.TransferID, frame.StreamToken, plan)
 		}()
 	}
 }
 
-func (s *sessionConn) streamUploadToHub(ctx context.Context, transferID, streamToken string, plan transfer.Plan) {
+func (r *nodeRunner) streamUploadToHub(ctx context.Context, transferID, streamToken string, plan transfer.Plan) {
 	pipeR, pipeW := io.Pipe()
 	writerDone := make(chan struct{})
 	var writeErr error
@@ -79,29 +79,29 @@ func (s *sessionConn) streamUploadToHub(ctx context.Context, transferID, streamT
 		_ = pipeR.Close()
 		<-writerDone
 	}()
-	targetURL := s.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/upload"
+	targetURL := r.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/upload"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, targetURL, pipeR)
 	if err != nil {
-		s.reportTransferDone(ctx, transferID, streamToken, err.Error())
+		r.reportTransferDone(ctx, transferID, streamToken, err.Error())
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+r.token)
 	req.Header.Set("X-Transfer-Token", streamToken)
 	req.Header.Set("Content-Type", "application/x-tar")
-	resp, doErr := s.httpClient.Do(req)
+	resp, doErr := r.httpClient.Do(req)
 	if doErr != nil {
-		s.reportTransferDone(ctx, transferID, streamToken, s.resolveWriteErr(pipeR, writerDone, &writeErr, doErr))
+		r.reportTransferDone(ctx, transferID, streamToken, resolveWriteErr(pipeR, writerDone, &writeErr, doErr))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		statusErr := fmt.Errorf("upload status %s", resp.Status)
-		s.reportTransferDone(ctx, transferID, streamToken, s.resolveWriteErr(pipeR, writerDone, &writeErr, statusErr))
+		r.reportTransferDone(ctx, transferID, streamToken, resolveWriteErr(pipeR, writerDone, &writeErr, statusErr))
 	}
 }
 
-func (s *sessionConn) resolveWriteErr(pipeR *io.PipeReader, writerDone <-chan struct{}, writeErr *error, fallback error) string {
+func resolveWriteErr(pipeR *io.PipeReader, writerDone <-chan struct{}, writeErr *error, fallback error) string {
 	_ = pipeR.Close()
 	<-writerDone
 	if *writeErr != nil && !errors.Is(*writeErr, io.ErrClosedPipe) {
@@ -110,23 +110,23 @@ func (s *sessionConn) resolveWriteErr(pipeR *io.PipeReader, writerDone <-chan st
 	return fallback.Error()
 }
 
-func (s *sessionConn) streamDownloadFromHub(ctx context.Context, transferID, streamToken, targetDir string) {
-	targetURL := s.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/download"
+func (r *nodeRunner) streamDownloadFromHub(ctx context.Context, transferID, streamToken, targetDir string) {
+	targetURL := r.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/download"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		s.reportTransferDone(ctx, transferID, streamToken, err.Error())
+		r.reportTransferDone(ctx, transferID, streamToken, err.Error())
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+r.token)
 	req.Header.Set("X-Transfer-Token", streamToken)
-	resp, doErr := s.httpClient.Do(req)
+	resp, doErr := r.httpClient.Do(req)
 	if doErr != nil {
-		s.reportTransferDone(ctx, transferID, streamToken, doErr.Error())
+		r.reportTransferDone(ctx, transferID, streamToken, doErr.Error())
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		s.reportTransferDone(ctx, transferID, streamToken, fmt.Sprintf("download status %s", resp.Status))
+		r.reportTransferDone(ctx, transferID, streamToken, fmt.Sprintf("download status %s", resp.Status))
 		return
 	}
 	limited := io.LimitReader(resp.Body, transfer.MaxRawTarStreamBytes)
@@ -138,25 +138,25 @@ func (s *sessionConn) streamDownloadFromHub(ctx context.Context, transferID, str
 	if extractErr != nil {
 		errMsg = extractErr.Error()
 	}
-	s.reportTransferDone(ctx, transferID, streamToken, errMsg)
+	r.reportTransferDone(ctx, transferID, streamToken, errMsg)
 }
 
-func (s *sessionConn) reportTransferDone(ctx context.Context, transferID, streamToken, errMsg string) {
+func (r *nodeRunner) reportTransferDone(ctx context.Context, transferID, streamToken, errMsg string) {
 	reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), frameTimeout)
 	defer cancel()
 	body, err := json.Marshal(map[string]string{"error": errMsg})
 	if err != nil {
 		return
 	}
-	targetURL := s.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/done"
+	targetURL := r.hubURL + "/v1/node-transfers/" + url.PathEscape(transferID) + "/done"
 	req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if reqErr != nil {
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+r.token)
 	req.Header.Set("X-Transfer-Token", streamToken)
 	req.Header.Set("Content-Type", "application/json")
-	resp, doErr := s.httpClient.Do(req)
+	resp, doErr := r.httpClient.Do(req)
 	if doErr != nil {
 		return
 	}

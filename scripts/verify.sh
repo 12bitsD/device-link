@@ -20,13 +20,16 @@ go vet ./...
 echo "==> staticcheck"
 staticcheck ./...
 
-echo "==> deadcode (whole-program reachability from ./cmd/dl)"
-unreachable=$(go run golang.org/x/tools/cmd/deadcode@v0.41.0 ./cmd/dl)
-if [ -n "$unreachable" ]; then
-  echo "unreachable code detected:"
-  echo "$unreachable"
-  exit 1
-fi
+echo "==> deadcode (whole-program reachability from ./cmd/dl across darwin/linux/windows)"
+GOBIN="$tmp_dir" go install golang.org/x/tools/cmd/deadcode@v0.41.0
+for target_os in darwin linux windows; do
+  unreachable=$(CGO_ENABLED=0 GOOS="$target_os" GOARCH=amd64 "$tmp_dir/deadcode" ./cmd/dl)
+  if [ -n "$unreachable" ]; then
+    echo "unreachable code detected on $target_os:"
+    echo "$unreachable"
+    exit 1
+  fi
+done
 
 echo "==> Bits Go AST style + fixture self-tests"
 go test -count=1 ./internal/stylecheck

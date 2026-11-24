@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build 6 static release archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for os in darwin linux windows; do
+            for arch in amd64 arm64; do
+              stage=$(mktemp -d)
+              bin="dl"
+              [ "$os" = "windows" ] && bin="dl.exe"
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$stage/$bin" ./cmd/dl
+              if [ "$os" = "windows" ]; then
+                (cd "$stage" && zip -q "$GITHUB_WORKSPACE/dist/dl_${os}_${arch}.zip" dl.exe)
+              else
+                chmod 0755 "$stage/dl"
+                tar -C "$stage" -czf "dist/dl_${os}_${arch}.tar.gz" dl
+              fi
+              rm -rf "$stage"
+            done
+          done
+          (cd dist && sha256sum dl_* > checksums.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dl-release-archives
+          path: dist/*
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
