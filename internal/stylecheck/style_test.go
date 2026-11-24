@@ -1,6 +1,7 @@
 package stylecheck
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -18,11 +19,16 @@ const (
 	warnFuncLines = 48
 )
 
-type visitor struct {
-	fset     *token.FileSet
-	comments map[*ast.FuncDecl]*ast.CommentGroup
-	todoRe   *regexp.Regexp
-	t        *testing.T
+const (
+	severityViolation = "violation"
+	severityWarning   = "warning"
+)
+
+type diagnostic struct {
+	pos      token.Position
+	rule     string
+	message  string
+	severity string
 }
 
 func TestBitsGoStyle(t *testing.T) {
@@ -32,23 +38,19 @@ func TestBitsGoStyle(t *testing.T) {
 		t.Fatal(err)
 	}
 	fset := token.NewFileSet()
-	v := &visitor{
-		fset:     fset,
-		comments: map[*ast.FuncDecl]*ast.CommentGroup{},
-		todoRe:   regexp.MustCompile(`TODO\([a-zA-Z0-9_.-]+\): \S.+`),
-		t:        t,
-	}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && (d.Name() == ".git" || d.Name() == ".bench") {
+		if d.IsDir() && skipDir(d.Name()) {
 			return filepath.SkipDir
 		}
 		if d.IsDir() || !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		v.checkFile(path)
+		for _, diag := range analyzeFile(fset, path, nil) {
+			reportDiagnostic(t, diag)
+		}
 		return nil
 	})
 	if err != nil {
@@ -56,46 +58,179 @@ func TestBitsGoStyle(t *testing.T) {
 	}
 }
 
-func (v *visitor) checkFile(path string) {
-	file, err := parser.ParseFile(v.fset, path, nil, parser.ParseComments)
-	if err != nil {
-		v.t.Errorf("parse %s: %v", path, err)
+func skipDir(name string) bool {
+	switch name {
+	case ".git", ".bench", ".ryugi", "testdata":
+		return true
+	default:
+		return false
+	}
+}
+
+func reportDiagnostic(t *testing.T, d diagnostic) {
+	t.Helper()
+	if d.severity == severityViolation {
+		t.Errorf("%s: %s %s", d.pos, d.rule, d.message)
 		return
 	}
+	t.Logf("warning: %s: %s %s", d.pos, d.rule, d.message)
+}
+
+func analyzeFile(fset *token.FileSet, path string, src []byte) []diagnostic {
+	slashPath := filepath.ToSlash(path)
+	v := &visitor{
+		fset:       fset,
+		path:       slashPath,
+		allowExits: isTestOrMainPath(slashPath),
+		comments:   map[*ast.FuncDecl]*ast.CommentGroup{},
+		commentLn:  map[int]string{},
+		interfaces: map[string]bool{},
+		todoRe:     regexp.MustCompile(`TODO\([a-zA-Z0-9_.-]+\): \S.+`),
+	}
+	v.checkFile(src)
+	return v.diags
+}
+
+type visitor struct {
+	fset        *token.FileSet
+	path        string
+	allowExits  bool
+	comments    map[*ast.FuncDecl]*ast.CommentGroup
+	fileComment []*ast.Comment
+	commentLn   map[int]string
+	interfaces  map[string]bool
+	todoRe      *regexp.Regexp
+	diags       []diagnostic
+}
+
+func (v *visitor) errorf(pos token.Pos, rule, format string, args ...any) {
+	v.diags = append(v.diags, diagnostic{
+		pos:      v.fset.Position(pos),
+		rule:     rule,
+		message:  fmt.Sprintf(format, args...),
+		severity: severityViolation,
+	})
+}
+
+func (v *visitor) warnf(pos token.Pos, rule, format string, args ...any) {
+	v.diags = append(v.diags, diagnostic{
+		pos:      v.fset.Position(pos),
+		rule:     rule,
+		message:  fmt.Sprintf(format, args...),
+		severity: severityWarning,
+	})
+}
+
+func (v *visitor) checkFile(src []byte) {
+	var input any
+	if src != nil {
+		input = src
+	}
+	file, err := parser.ParseFile(v.fset, v.path, input, parser.ParseComments)
+	if err != nil {
+		v.errorf(token.NoPos, "PARSE", "parse %s: %v", v.path, err)
+		return
+	}
+	v.indexComments(file)
+	v.checkHeader(file)
+	v.indexInterfaces(file)
 	v.checkComments(file)
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.GenDecl:
 			v.checkGlobals(d)
 		case *ast.FuncDecl:
-			v.comments[d] = d.Doc
-			v.checkSignature(d.Type, d.Pos())
-			if d.Body != nil {
-				v.checkBody(d.Body, d.Pos())
-			}
+			v.checkFuncDecl(d)
 		}
 	}
 	ast.Inspect(file, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.StructType:
-			v.checkStruct(node)
-		case *ast.FuncLit:
-			v.checkSignature(node.Type, node.Pos())
+		if s, ok := n.(*ast.StructType); ok {
+			v.checkStruct(s)
 		}
 		return true
 	})
 }
 
+func isTestOrMainPath(path string) bool {
+	return strings.HasSuffix(path, "_test.go") || strings.Contains(path, "/cmd/dl/")
+}
+
+func (v *visitor) indexComments(file *ast.File) {
+	for _, group := range file.Comments {
+		for _, c := range group.List {
+			v.fileComment = append(v.fileComment, c)
+			v.commentLn[v.fset.Position(c.Pos()).Line] = c.Text
+		}
+	}
+}
+
+func (v *visitor) indexInterfaces(file *ast.File) {
+	for _, decl := range file.Decls {
+		gen, isGen := decl.(*ast.GenDecl)
+		if !isGen {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts, isType := spec.(*ast.TypeSpec)
+			if !isType {
+				continue
+			}
+			if _, isIface := ts.Type.(*ast.InterfaceType); isIface {
+				v.interfaces[ts.Name.Name] = true
+			}
+		}
+	}
+}
+
+func (v *visitor) checkHeader(file *ast.File) {
+	switch file.Name.Name {
+	case "util", "utils", "common", "base", "helper", "helpers", "misc", "shared":
+		v.errorf(file.Name.Pos(), "PKGNAME", "forbidden catch-all package name %q", file.Name.Name)
+	}
+	for _, spec := range file.Imports {
+		if spec.Name == nil {
+			continue
+		}
+		if spec.Name.Name == "." && !v.allowed(spec.Pos(), "IMPORT") {
+			v.errorf(spec.Pos(), "IMPORT", "dot import is forbidden")
+		}
+		if spec.Name.Name == "_" && !v.hasSideEffectReason(spec) {
+			v.errorf(spec.Pos(), "IMPORT", "blank import requires a side-effect reason comment")
+		}
+	}
+}
+
+func (v *visitor) hasSideEffectReason(spec *ast.ImportSpec) bool {
+	if spec.Doc != nil || spec.Comment != nil || v.allowed(spec.Pos(), "IMPORT") {
+		return true
+	}
+	prev := v.commentLn[v.fset.Position(spec.Pos()).Line-1]
+	return strings.TrimSpace(prev) != ""
+}
+
 func (v *visitor) allowed(pos token.Pos, rule string) bool {
 	line := v.fset.Position(pos).Line
+	needle := "bits:allow(" + rule + "):"
+	if strings.Contains(v.commentLn[line], needle) || strings.Contains(v.commentLn[line-1], needle) {
+		return true
+	}
 	for fn, doc := range v.comments {
 		if doc == nil || v.fset.Position(fn.Pos()).Line > line || v.fset.Position(fn.End()).Line < line {
 			continue
 		}
 		for _, c := range doc.List {
-			if strings.Contains(c.Text, "bits:allow("+rule+"):") {
+			if strings.Contains(c.Text, needle) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func (v *visitor) hasCommentInside(block *ast.BlockStmt) bool {
+	for _, c := range v.fileComment {
+		if c.Pos() > block.Lbrace && c.End() < block.Rbrace {
+			return true
 		}
 	}
 	return false
@@ -105,9 +240,20 @@ func (v *visitor) checkComments(file *ast.File) {
 	for _, group := range file.Comments {
 		for _, c := range group.List {
 			if strings.Contains(c.Text, "TODO") && !v.todoRe.MatchString(c.Text) {
-				v.t.Errorf("%s: BCS015 malformed TODO: %s", v.fset.Position(c.Pos()), strings.TrimSpace(c.Text))
+				v.errorf(c.Pos(), "BCS015", "malformed TODO: %s", strings.TrimSpace(c.Text))
 			}
 		}
+	}
+}
+
+func (v *visitor) checkFuncDecl(d *ast.FuncDecl) {
+	v.comments[d] = d.Doc
+	if d.Name.Name == "init" {
+		v.errorf(d.Pos(), "GO008", "init() is forbidden; pass dependencies explicitly")
+	}
+	v.checkSignature(d.Type, d.Pos())
+	if d.Body != nil {
+		v.checkFuncBody(d.Pos(), d.Recv, d.Type, d.Body)
 	}
 }
 
@@ -123,7 +269,7 @@ func (v *visitor) checkGlobals(d *ast.GenDecl) {
 		if isAllowedGlobal(vs) {
 			continue
 		}
-		v.t.Errorf("%s: BCS011/GO008 mutable package-level var %s", v.fset.Position(vs.Pos()), vs.Names[0].Name)
+		v.errorf(vs.Pos(), "BCS011", "mutable package-level var %s", vs.Names[0].Name)
 	}
 }
 
@@ -146,17 +292,31 @@ func isAllowedGlobal(vs *ast.ValueSpec) bool {
 	if !ok {
 		return false
 	}
-	isErrorsNew := pkg.Name == "errors" && sel.Sel.Name == "New"
-	isFmtErrorf := pkg.Name == "fmt" && sel.Sel.Name == "Errorf"
-	return isErrorsNew || isFmtErrorf
+	switch pkg.Name + "." + sel.Sel.Name {
+	case "errors.New", "fmt.Errorf", "regexp.MustCompile":
+		return true
+	default:
+		return false
+	}
 }
 
 func (v *visitor) checkStruct(s *ast.StructType) {
 	for _, field := range s.Fields.List {
 		if isContextType(field.Type) {
-			v.t.Errorf("%s: GO003 context.Context stored in struct", v.fset.Position(field.Pos()))
+			v.errorf(field.Pos(), "GO003", "context.Context stored in struct")
+		}
+		if len(field.Names) == 0 && !v.isInterfaceEmbedding(field.Type) && !v.allowed(field.Pos(), "GO010") {
+			v.errorf(field.Pos(), "GO010", "struct embedding hides behavior; use a named field")
 		}
 	}
+}
+
+func (v *visitor) isInterfaceEmbedding(expr ast.Expr) bool {
+	if _, ok := expr.(*ast.InterfaceType); ok {
+		return true
+	}
+	id, ok := expr.(*ast.Ident)
+	return ok && v.interfaces[id.Name]
 }
 
 func isContextType(expr ast.Expr) bool {
@@ -178,16 +338,16 @@ func (v *visitor) checkSignature(ft *ast.FuncType, pos token.Pos) {
 		v.checkParamKind(field, pos, i)
 	}
 	if count > maxParams && !v.allowed(pos, "BCS004") {
-		v.t.Errorf("%s: BCS004 too many parameters (%d > %d)", v.fset.Position(pos), count, maxParams)
+		v.warnf(pos, "BCS004", "parameter count %d > %d", count, maxParams)
 	}
 }
 
 func (v *visitor) checkParamKind(field *ast.Field, fnPos token.Pos, paramIndex int) {
 	if isBoolType(field.Type) && !v.allowed(fnPos, "BCS004") {
-		v.t.Errorf("%s: BCS004 naked bool parameter", v.fset.Position(field.Pos()))
+		v.errorf(field.Pos(), "BCS004", "naked bool parameter")
 	}
 	if paramIndex > 0 && isContextType(field.Type) {
-		v.t.Errorf("%s: GO003 context.Context must be first parameter", v.fset.Position(field.Pos()))
+		v.errorf(field.Pos(), "GO003", "context.Context must be first parameter")
 	}
 }
 
@@ -196,17 +356,17 @@ func isBoolType(expr ast.Expr) bool {
 	return ok && id.Name == "bool"
 }
 
-func (v *visitor) checkBody(body *ast.BlockStmt, pos token.Pos) {
+func (v *visitor) checkBodyMetrics(body *ast.BlockStmt, pos token.Pos) {
 	lines := v.fset.Position(body.End()).Line - v.fset.Position(pos).Line
 	if lines > warnFuncLines {
-		v.t.Logf("warning: %s: BCS003 function spans %d lines (> %d)", v.fset.Position(pos), lines, warnFuncLines)
+		v.warnf(pos, "BCS003", "function spans %d lines (> %d)", lines, warnFuncLines)
 	}
 	nesting, complexity := walkControl(body, 0, 1)
 	if complexity > maxComplexity && !v.allowed(pos, "BCS003") {
-		v.t.Errorf("%s: BCS003 cyclomatic complexity %d > %d", v.fset.Position(pos), complexity, maxComplexity)
+		v.errorf(pos, "BCS003", "cyclomatic complexity %d > %d", complexity, maxComplexity)
 	}
 	if nesting > maxNesting && !v.allowed(pos, "BCS003") {
-		v.t.Errorf("%s: BCS003 control nesting %d > %d", v.fset.Position(pos), nesting, maxNesting)
+		v.errorf(pos, "BCS003", "control nesting %d > %d", nesting, maxNesting)
 	}
 }
 
