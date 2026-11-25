@@ -35,7 +35,7 @@ echo "==> Bits Go AST style + fixture self-tests"
 go test -count=1 ./internal/stylecheck
 
 echo "==> bits CLI audit (unsupported must only be Go files covered by AST gate)"
-if command -v bits >/dev/null 2>&1; then
+if command -v bits >/dev/null 2>&1 && bits style --help >/dev/null 2>&1; then
   bits_report="$tmp_dir/bits.json"
   bits style report . --format json --output "$bits_report" >/dev/null
   python3 - "$bits_report" <<'PY'

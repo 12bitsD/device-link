@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -18,14 +19,18 @@ func TestStage3RegressionColonLocalDotDotAndJSONSchema(t *testing.T) {
 func s3CheckColonLocalAndDotDot(t *testing.T, env *s3Env) {
 	t.Helper()
 	srcRoot := t.TempDir()
-	colonSrc := filepath.Join(srcRoot, "12:00.log")
+	fileName := "12:00.log"
+	if runtime.GOOS == "windows" {
+		fileName = "12_00.log"
+	}
+	colonSrc := filepath.Join(srcRoot, fileName)
 	s3WriteFile(t, colonSrc, []byte("colon-ok"), 0o644)
 	dst := filepath.Join(t.TempDir(), "colon-dst")
 	sum := s3RequireCompletedCP(t, s3RunCP(t, env.h, colonSrc, "node-b:"+dst))
 	s3AssertSummary(t, sum, s3TransferSummary{files: 1, skipped: 0, transferred: 8, total: 8})
-	s3AssertFileContent(t, filepath.Join(dst, "12:00.log"), "colon-ok")
+	s3AssertFileContent(t, filepath.Join(dst, fileName), "colon-ok")
 
-	dotDotSrc := filepath.Join(srcRoot, "sub") + "/../12:00.log"
+	dotDotSrc := filepath.Join(srcRoot, "sub") + "/../" + fileName
 	resDotSrc := s3RunCP(t, env.h, dotDotSrc, "node-b:"+dst)
 	requireFailure(t, resDotSrc.combined(), resDotSrc.err)
 

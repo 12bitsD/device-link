@@ -72,22 +72,15 @@ func TestMain(m *testing.M) {
 }
 
 func buildAndRunTests(m *testing.M, tempDir, binary string) int {
-	workDir, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	root := filepath.Clean(filepath.Join(workDir, "..", ".."))
-	cmd := exec.Command("go", "build", "-o", binary, "./cmd/dl")
-	cmd.Dir = root
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "build dl: %v\n%s", err, output)
-		return 1
-	}
-	if err := os.Setenv(binaryEnv, binary); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	if os.Getenv(binaryEnv) == "" {
+		if err := buildDLBinary(binary); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if err := os.Setenv(binaryEnv, binary); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 	}
 	procTmpRoot := filepath.Join(tempDir, "tmp")
 	if err := os.MkdirAll(procTmpRoot, 0o700); err != nil {
@@ -99,6 +92,21 @@ func buildAndRunTests(m *testing.M, tempDir, binary string) int {
 		return 1
 	}
 	return m.Run()
+}
+
+func buildDLBinary(binary string) error {
+	workDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	root := filepath.Clean(filepath.Join(workDir, "..", ".."))
+	cmd := exec.Command("go", "build", "-o", binary, "./cmd/dl")
+	cmd.Dir = root
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("build dl: %w\n%s", err, output)
+	}
+	return nil
 }
 
 type hub struct {
@@ -444,13 +452,96 @@ func (h *hub) invite(t *testing.T, name string) []string {
 	if err != nil {
 		t.Fatalf("invite %s: %v\n%s", name, err, output)
 	}
-	fields := strings.Fields(strings.TrimSpace(output))
-	if len(fields) != 8 || fields[0] != "dl" || fields[1] != "join" {
-		t.Fatalf("invite output is not one dl join command: %q", output)
+	fields, parseErr := splitCommandFields(output)
+	if parseErr != nil || len(fields) != 8 || fields[0] != "dl" || fields[1] != "join" {
+		t.Fatalf("invite output is not one dl join command (%v): %q", parseErr, output)
 	}
 	joinArgs := fields[1:]
 	validateJoinArgs(t, joinArgs)
 	return joinArgs
+}
+
+func splitCommandFields(line string) ([]string, error) {
+	trimmed := strings.TrimSpace(line)
+	if strings.ContainsRune(trimmed, '\n') {
+		return nil, fmt.Errorf("unexpected multiline command: %q", line)
+	}
+	var args []string
+	for rest := trimmed; rest != ""; {
+		arg, next, err := nextCommandField(rest)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+		rest = strings.TrimLeft(next, " \t\r")
+	}
+	return args, nil
+}
+
+func nextCommandField(raw string) (string, string, error) {
+	var b strings.Builder
+	input := raw
+	for i := 0; i < len(input); {
+		ch := input[i]
+		if strings.ContainsRune(" \t\r", rune(ch)) {
+			return b.String(), input[i:], nil
+		}
+		if ch == '\'' {
+			seg, next, err := readSingleQuoted(input[i+1:])
+			if err != nil {
+				return "", "", err
+			}
+			b.WriteString(seg)
+			input = next
+			i = 0
+			continue
+		}
+		if ch == '"' {
+			seg, next, err := readWindowsQuoted(input[i+1:])
+			if err != nil {
+				return "", "", err
+			}
+			b.WriteString(seg)
+			input = next
+			i = 0
+			continue
+		}
+		b.WriteByte(ch)
+		i++
+	}
+	return b.String(), "", nil
+}
+
+func readSingleQuoted(input string) (string, string, error) {
+	end := strings.IndexByte(input, '\'')
+	if end < 0 {
+		return "", "", errors.New("unterminated single quote")
+	}
+	return input[:end], input[end+1:], nil
+}
+
+func readWindowsQuoted(input string) (string, string, error) {
+	var b strings.Builder
+	slashes := 0
+	for i := 0; i < len(input); i++ {
+		if input[i] == '\\' {
+			slashes++
+			continue
+		}
+		if input[i] == '"' {
+			b.WriteString(strings.Repeat(`\`, slashes/2))
+			if slashes%2 == 0 {
+				return b.String(), input[i+1:], nil
+			}
+			b.WriteByte('"')
+			slashes = 0
+			continue
+		}
+		b.WriteString(strings.Repeat(`\`, slashes))
+		b.WriteByte(input[i])
+		slashes = 0
+	}
+	return "", "", errors.New("unterminated double quote")
 }
 
 func validateJoinArgs(t *testing.T, args []string) {

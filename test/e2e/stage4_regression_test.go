@@ -171,3 +171,35 @@ func TestStage4RegressionWindowsCIPwshGuard(t *testing.T) {
 		t.Fatalf("%s missing PowerShell native error preference guard", ciPath)
 	}
 }
+
+func TestStage4RegressionQuotedInviteAndForeignBitsCLI(t *testing.T) {
+	h := newHub(t)
+	spacedDir := filepath.Join(t.TempDir(), "ca with space")
+	if err := os.MkdirAll(spacedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	caBytes, err := os.ReadFile(h.caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spacedCA := filepath.Join(spacedDir, "cert.pem")
+	if err := os.WriteFile(spacedCA, caBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.caPath = spacedCA
+	_ = h.joinWithInvite(t, "quoted-ca-node")
+	h.waitDevice(t, "quoted-ca-node", "alive")
+
+	winInvite := `dl join --hub https://127.0.0.1:8443 --code abc123 --ca "C:\Users\runneradmin\AppData\Local\Temp\Test dir\cert.pem"`
+	parsed, parseErr := splitCommandFields(winInvite)
+	wantCA := `C:\Users\runneradmin\AppData\Local\Temp\Test dir\cert.pem`
+	if parseErr != nil || len(parsed) != 8 || parsed[7] != wantCA {
+		t.Fatalf("parsed windows invite = %q (err=%v), want [7]=%q", parsed, parseErr, wantCA)
+	}
+
+	verifyPath := filepath.Join(s4RepoRoot(t), "scripts", "verify.sh")
+	verifyContent := s4ReadNonEmptyFile(t, verifyPath)
+	if !strings.Contains(verifyContent, "bits style --help") {
+		t.Fatalf("%s must probe 'bits style --help' so Ubuntu /usr/bin/bits does not break CI", verifyPath)
+	}
+}

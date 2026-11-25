@@ -91,9 +91,9 @@ func TestStage1LinuxContainerJoinAndLS(t *testing.T) {
 func verifyTTLConnectedLine(t *testing.T, h *hub, name, ttl string) {
 	t.Helper()
 	inviteOut := mustController(t, h, "invite", "--name", name, "--ttl", ttl)
-	fields := strings.Fields(strings.TrimSpace(inviteOut))
-	if len(fields) != 8 || fields[0] != "dl" || fields[1] != "join" {
-		t.Fatalf("unexpected ttl invite output: %q", inviteOut)
+	fields, parseErr := splitCommandFields(inviteOut)
+	if parseErr != nil || len(fields) != 8 || fields[0] != "dl" || fields[1] != "join" {
+		t.Fatalf("unexpected ttl invite output (%v): %q", parseErr, inviteOut)
 	}
 	joinArgs := append([]string{}, fields[1:]...)
 	validateJoinArgs(t, joinArgs)
@@ -448,9 +448,9 @@ func mintContainerInviteCode(t *testing.T, h *hub) string {
 	if err != nil {
 		t.Fatalf("invite linux-node: %v\n%s", err, output)
 	}
-	fields := strings.Fields(strings.TrimSpace(output))
-	if len(fields) < 4 || fields[0] != "dl" || fields[1] != "join" {
-		t.Fatalf("unexpected invite output: %q", output)
+	fields, parseErr := splitCommandFields(output)
+	if parseErr != nil || len(fields) < 4 || fields[0] != "dl" || fields[1] != "join" {
+		t.Fatalf("unexpected invite output (%v): %q", parseErr, output)
 	}
 	validateJoinArgs(t, fields[1:])
 	for i := 2; i+1 < len(fields); i += 2 {

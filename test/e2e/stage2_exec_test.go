@@ -597,7 +597,26 @@ func isPIDDead(pid int) bool {
 		return true
 	}
 	sigErr := proc.Signal(syscall.Signal(0))
-	return errors.Is(sigErr, os.ErrProcessDone)
+	if errors.Is(sigErr, os.ErrProcessDone) {
+		return true
+	}
+	return isLinuxZombie(pid)
+}
+
+func isLinuxZombie(pid int) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	idx := strings.LastIndexByte(string(data), ')')
+	if idx < 0 || idx+2 >= len(data) {
+		return false
+	}
+	state := data[idx+2]
+	return state == 'Z' || state == 'X'
 }
 
 func resumeProxyAfter(ctx context.Context, proxy *tcpProxy, delay time.Duration) <-chan error {
