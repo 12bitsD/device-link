@@ -202,4 +202,10 @@ func TestStage4RegressionQuotedInviteAndForeignBitsCLI(t *testing.T) {
 	if !strings.Contains(verifyContent, "Usage: bits style") {
 		t.Fatalf("%s must verify 'Usage: bits style' output because util-linux /usr/bin/bits exits 0 on --help", verifyPath)
 	}
+
+	relPath := filepath.Join(s4RepoRoot(t), ".github", "workflows", "release.yml")
+	relContent := s4ReadNonEmptyFile(t, relPath)
+	if strings.Contains(relContent, `[ "$os" = "windows" ] &&`) {
+		t.Fatalf("%s contains set -e short-circuit trap '[ \"$os\" = \"windows\" ] &&'", relPath)
+	}
 }

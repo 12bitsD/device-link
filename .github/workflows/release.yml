@@ -28,7 +28,9 @@ jobs:
             for arch in amd64 arm64; do
               stage=$(mktemp -d)
               bin="dl"
-              [ "$os" = "windows" ] && bin="dl.exe"
+              if [ "$os" = "windows" ]; then
+                bin="dl.exe"
+              fi
               CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$stage/$bin" ./cmd/dl
               if [ "$os" = "windows" ]; then
                 (cd "$stage" && zip -q "$GITHUB_WORKSPACE/dist/dl_${os}_${arch}.zip" dl.exe)
