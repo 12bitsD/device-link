@@ -199,7 +199,7 @@ func TestStage4RegressionQuotedInviteAndForeignBitsCLI(t *testing.T) {
 
 	verifyPath := filepath.Join(s4RepoRoot(t), "scripts", "verify.sh")
 	verifyContent := s4ReadNonEmptyFile(t, verifyPath)
-	if !strings.Contains(verifyContent, "bits style --help") {
-		t.Fatalf("%s must probe 'bits style --help' so Ubuntu /usr/bin/bits does not break CI", verifyPath)
+	if !strings.Contains(verifyContent, "Usage: bits style") {
+		t.Fatalf("%s must verify 'Usage: bits style' output because util-linux /usr/bin/bits exits 0 on --help", verifyPath)
 	}
 }
